@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+job_search.db
+*.pyc
+__pycache__/
