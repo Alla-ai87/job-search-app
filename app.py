@@ -1185,20 +1185,6 @@ def render_settings(results: pd.DataFrame) -> None:
     if st.session_state.get("cv_text"):
         st.caption(f"Current CV text loaded: {len(st.session_state['cv_text']):,} characters.")
 
-    st.markdown("### Email Settings")
-    recipient_email = st.text_input("Recipient email", value=st.session_state.get("recipient_email", ""))
-    st.session_state["recipient_email"] = recipient_email
-    st.caption("Email is sent through SMTP credentials stored only in Streamlit secrets.")
-    if st.button("Send Top 10 Email Summary"):
-        if not recipient_email:
-            st.warning("Enter a recipient email first.")
-        else:
-            success, message = send_email_summary(recipient_email, top_best_matches(results, limit=10))
-            if success:
-                st.success(message)
-            else:
-                st.error(message)
-
 
 def main() -> None:
     st.set_page_config(page_title="U.S. Job Search", layout="wide")
