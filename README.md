@@ -6,7 +6,7 @@ This is a Streamlit Cloud app for searching U.S. jobs from an uploaded Excel lis
 
 - Upload an Excel file where Column A is company names and Column B is target job titles.
 - Save target company/title pairs in local SQLite storage.
-- Run Google Jobs searches through SerpAPI.
+- Run multiple Google Jobs searches through SerpAPI for each company/title pair.
 - Save search results while skipping duplicates.
 - Filter results for relevant titles before saving.
 - Save a `relevance_score` and `relevance_reason` for each job.
@@ -97,6 +97,9 @@ Infrastructure context adds 1 point:
 - `wastewater`
 - `aviation`
 - `airport`
+- `highway`
+- `bridge`
+- `tunnel`
 - `design-build`
 
 Generic project-manager titles score only when infrastructure context is also present.
@@ -113,9 +116,27 @@ These terms reject the job immediately:
 - `architect`
 - `data center`
 
-Jobs with `relevance_score` below 2 are not saved in new searches. Saved rows include `relevance_reason`, which explains strong matches, infrastructure context, or exclusion reasons.
+Jobs with `relevance_score` below 1 are not saved in new searches. Saved rows include `relevance_reason`, which explains strong matches, infrastructure context, or exclusion reasons.
 
 The dashboard includes optional filters for `Show only top 10 highest relevance jobs per run` and a `Minimum relevance score` slider with a default of 2 and range from 1 to 5. New searches are saved with a run ID so each run can be ranked separately.
+
+## Search Coverage
+
+For each company/title pair, the app runs these SerpAPI Google Jobs query variations:
+
+- `{job_title} {company} jobs United States`
+- `{job_title} {company} careers`
+- `{job_title} {company} LinkedIn jobs`
+- `{job_title} {company} infrastructure jobs`
+- `{job_title} {company} construction jobs`
+- `{job_title} {company} rail transit jobs`
+
+The sidebar includes:
+
+- `Max jobs per company/title`, default 10, range 3-20.
+- `Include broader infrastructure management jobs`, default on.
+
+Results are deduplicated by job ID, application link, and title/employer/location before relevance filtering.
 
 ## Sponsorship Detection
 
