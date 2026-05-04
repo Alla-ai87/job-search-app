@@ -64,7 +64,7 @@ The app never prints the API key, stores it in the database, or sends it to the 
 
 ## Job Relevance Filtering
 
-The app lowercases each job title, then scores only targeted controls, contracts, PMO, risk-manager, scheduler, and planning-manager roles.
+The app lowercases each job title and applies balanced relevance scoring to new searches only. Existing saved jobs are not deleted automatically.
 
 Strong title matches add 3 points:
 
@@ -72,37 +72,50 @@ Strong title matches add 3 points:
 - `program controls`
 - `contracts`
 - `contract manager`
+- `contract management`
 - `pmo`
 - `risk manager`
 - `scheduler`
 - `planning manager`
 
-Medium title matches add 1 point:
+Infrastructure management roles can be included when paired with infrastructure context. The role adds 1 point:
 
 - `project manager`
 - `senior project manager`
+- `construction manager`
+- `controls manager`
+- `program manager`
 
-Generic project-manager titles are not saved unless they also include `controls`, `contracts`, or `PMO`.
+Infrastructure context adds 1 point:
 
-These terms subtract 3 points:
+- `construction`
+- `rail`
+- `transit`
+- `metro`
+- `infrastructure`
+- `water`
+- `wastewater`
+- `aviation`
+- `airport`
+- `design-build`
+
+Generic project-manager titles score only when infrastructure context is also present.
+
+These terms reject the job immediately:
 
 - `software`
 - `developer`
-- `architect`
-- `network`
 - `cloud`
+- `network`
 - `IT`
-- `civil inspector`
-- `electrical inspector`
 - `technician`
-- `commissioning`
-- `field material controller`
+- `inspector`
+- `architect`
 - `data center`
-- `airport inspector`
 
-Jobs with `relevance_score` below 2 are not saved. Saved rows include `relevance_reason`, which explains the matched terms and penalties.
+Jobs with `relevance_score` below 2 are not saved in new searches. Saved rows include `relevance_reason`, which explains strong matches, infrastructure context, or exclusion reasons.
 
-The dashboard includes optional filters for `Show only top 10 highest relevance jobs per run` and `Show only jobs with relevance_score >= 2`. New searches are saved with a run ID so each run can be ranked separately.
+The dashboard includes optional filters for `Show only top 10 highest relevance jobs per run` and a `Minimum relevance score` slider with a default of 2 and range from 1 to 5. New searches are saved with a run ID so each run can be ranked separately.
 
 ## Sponsorship Detection
 

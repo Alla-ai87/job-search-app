@@ -45,38 +45,47 @@ STRONG_RELEVANCE_TERMS = (
     "program controls",
     "contracts",
     "contract manager",
+    "contract management",
     "pmo",
     "risk manager",
     "scheduler",
     "planning manager",
 )
 
-MEDIUM_RELEVANCE_TERMS = (
+INFRASTRUCTURE_MANAGEMENT_TERMS = (
     "project manager",
     "senior project manager",
+    "construction manager",
+    "controls manager",
+    "program manager",
 )
 
-GENERIC_PROJECT_MANAGER_CONTEXT_TERMS = (
-    "controls",
-    "contracts",
-    "pmo",
+INFRASTRUCTURE_CONTEXT_TERMS = (
+    "construction",
+    "rail",
+    "transit",
+    "metro",
+    "infrastructure",
+    "water",
+    "wastewater",
+    "aviation",
+    "airport",
+    "design-build",
 )
 
 EXCLUDED_RELEVANCE_TERMS = (
     "software",
     "developer",
-    "architect",
-    "network",
     "cloud",
+    "network",
     "it",
-    "civil inspector",
-    "electrical inspector",
     "technician",
-    "commissioning",
-    "field material controller",
+    "inspector",
+    "architect",
     "data center",
-    "airport inspector",
 )
+
+SAVE_RELEVANCE_THRESHOLD = 2
 
 
 def get_connection() -> sqlite3.Connection:
@@ -129,30 +138,12 @@ def init_db() -> None:
         ensure_column(conn, "job_results", "relevance_reason", "TEXT")
         ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
         ensure_column(conn, "job_results", "run_started_at", "TEXT")
-        refresh_existing_relevance(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-
-
-def refresh_existing_relevance(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("SELECT id, title FROM job_results").fetchall()
-    for row in rows:
-        relevance_score, relevance_reason, is_excluded = score_job_relevance(row["title"])
-        if is_excluded or relevance_score < 2:
-            conn.execute("DELETE FROM job_results WHERE id = ?", (row["id"],))
-            continue
-        conn.execute(
-            """
-            UPDATE job_results
-            SET relevance_score = ?, relevance_reason = ?
-            WHERE id = ?
-            """,
-            (relevance_score, relevance_reason, row["id"]),
-        )
 
 
 def clean_text(value: object) -> str:
@@ -263,28 +254,29 @@ def score_job_relevance(title: str) -> tuple[int, str, bool]:
         return 0, "No job title found.", False
 
     excluded_terms = [term for term in EXCLUDED_RELEVANCE_TERMS if contains_term(title, term)]
+    if excluded_terms:
+        return 0, f"Rejected because title contains excluded term: {', '.join(excluded_terms)}.", True
+
     strong_terms = [term for term in STRONG_RELEVANCE_TERMS if contains_term(title, term)]
-    medium_terms = [term for term in MEDIUM_RELEVANCE_TERMS if contains_term(title, term)]
+    management_terms = [term for term in INFRASTRUCTURE_MANAGEMENT_TERMS if contains_term(title, term)]
+    context_terms = [term for term in INFRASTRUCTURE_CONTEXT_TERMS if contains_term(title, term)]
+    has_context = bool(context_terms)
 
-    if medium_terms and not strong_terms and not any(term in title for term in GENERIC_PROJECT_MANAGER_CONTEXT_TERMS):
-        return 0, "Generic project manager title without controls, contracts, or PMO context.", False
-
-    score = (len(strong_terms) * 3) + (len(medium_terms) * 1) - (len(excluded_terms) * 3)
+    score = len(strong_terms) * 3
     reasons = []
     if strong_terms:
         reasons.append(f"Strong match +3 each: {', '.join(strong_terms)}")
-    if medium_terms:
-        reasons.append(f"Medium match +1 each: {', '.join(medium_terms)}")
-    if excluded_terms:
-        reasons.append(f"Exclude terms -3 each: {', '.join(excluded_terms)}")
+    if management_terms and has_context:
+        score += 1
+        reasons.append(f"Infrastructure management role +1: {', '.join(management_terms)}")
+        score += 1
+        reasons.append(f"Infrastructure context +1: {', '.join(context_terms)}")
+    elif management_terms and not strong_terms:
+        reasons.append(f"Management role found but no infrastructure context: {', '.join(management_terms)}")
 
-    if not strong_terms:
-        reason = "; ".join(reasons) if reasons else "No targeted controls, contracts, PMO, risk-manager, scheduler, or planning-manager title terms found."
+    if not strong_terms and not (management_terms and has_context):
+        reason = "; ".join(reasons) if reasons else "No strong match or infrastructure-context management role found."
         return 0, reason, False
-
-    if score < 2:
-        reason = "; ".join(reasons) if reasons else "No targeted controls, contracts, PMO, risk, scheduler, or planning-manager title terms found."
-        return score, reason, False
 
     return score, "; ".join(reasons), False
 
@@ -513,15 +505,6 @@ def render_search_section(targets: pd.DataFrame) -> None:
         value=min(10, max(1, len(targets))),
         step=1,
     )
-    relevance_threshold = st.number_input(
-        "Minimum relevance score to save",
-        min_value=2,
-        max_value=12,
-        value=2,
-        step=1,
-        help="Strong controls/contracts/PMO matches add 3, generic project manager adds 1, and excluded terms subtract 3.",
-    )
-
     disabled = targets.empty or not api_key
     if st.button("Run Job Search", type="primary", disabled=disabled):
         selected_targets = targets.head(int(max_targets))
@@ -542,7 +525,7 @@ def render_search_section(targets: pd.DataFrame) -> None:
                     row.company,
                     row.job_title,
                     jobs,
-                    int(relevance_threshold),
+                    SAVE_RELEVANCE_THRESHOLD,
                 )
                 total_inserted += inserted
                 total_skipped += skipped
@@ -571,8 +554,8 @@ def render_dashboard(results: pd.DataFrame) -> None:
     col2.metric("Companies", results["company"].nunique())
     col3.metric("Sponsorship available", (results["sponsorship_status"] == "sponsorship available").sum())
     st.caption(
-        "Saved jobs must include at least one allowed title term and no excluded title terms. "
-        "Relevance score is the count of allowed terms matched in the title."
+        "New searches save jobs with relevance_score >= 2. Strong controls/contracts/PMO matches score highest; "
+        "infrastructure management titles need sector context."
     )
 
     sponsorship_filter = st.multiselect(
@@ -596,16 +579,18 @@ def render_dashboard(results: pd.DataFrame) -> None:
         "Show only top 10 highest relevance jobs per run",
         value=False,
     )
-    high_relevance_only = st.checkbox(
-        "Show only jobs with relevance_score >= 2",
-        value=False,
+    minimum_relevance_score = st.slider(
+        "Minimum relevance score",
+        min_value=1,
+        max_value=5,
+        value=2,
+        step=1,
     )
 
     filtered = results[results["sponsorship_status"].isin(sponsorship_filter)]
     if company_filter:
         filtered = filtered[filtered["company"].isin(company_filter)]
-    if high_relevance_only:
-        filtered = filtered[filtered["relevance_score"] >= 2]
+    filtered = filtered[filtered["relevance_score"] >= minimum_relevance_score]
     if top_10_per_run:
         filtered = top_jobs_per_run(filtered, limit=10)
 
