@@ -64,24 +64,27 @@ The app never prints the API key, stores it in the database, or sends it to the 
 
 ## Job Relevance Filtering
 
-The app lowercases each job title, then adds 1 point to `relevance_score` for every matching positive title term:
+The app lowercases each job title, then scores only targeted controls, contracts, PMO, risk-manager, scheduler, and planning-manager roles.
 
-- `contract`
-- `contracts`
-- `contract manager`
-- `contract management`
-- `pmo`
+Strong title matches add 3 points:
+
 - `project controls`
 - `program controls`
+- `contracts`
+- `contract manager`
+- `pmo`
 - `risk manager`
-- `risk`
 - `scheduler`
-- `planning`
-- `schedule manager`
-- `project manager`
-- `construction manager`
+- `planning manager`
 
-The app excludes jobs whose title contains any of these terms, so they are not saved to the results table:
+Medium title matches add 1 point:
+
+- `project manager`
+- `senior project manager`
+
+Generic project-manager titles are not saved unless they also include `controls`, `contracts`, or `PMO`.
+
+These terms subtract 3 points:
 
 - `software`
 - `developer`
@@ -97,7 +100,7 @@ The app excludes jobs whose title contains any of these terms, so they are not s
 - `data center`
 - `airport inspector`
 
-Jobs with `relevance_score` below 1 are not saved. Saved rows include `relevance_reason`, which explains the matched terms.
+Jobs with `relevance_score` below 2 are not saved. Saved rows include `relevance_reason`, which explains the matched terms and penalties.
 
 The dashboard includes optional filters for `Show only top 10 highest relevance jobs per run` and `Show only jobs with relevance_score >= 2`. New searches are saved with a run ID so each run can be ranked separately.
 

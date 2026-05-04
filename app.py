@@ -40,21 +40,26 @@ SPONSORSHIP_NOT_AVAILABLE_PATTERNS = (
     r"\bcannot\s+sponsor\b",
 )
 
-POSITIVE_RELEVANCE_TERMS = (
-    "contract",
-    "contracts",
-    "contract manager",
-    "contract management",
-    "pmo",
+STRONG_RELEVANCE_TERMS = (
     "project controls",
     "program controls",
+    "contracts",
+    "contract manager",
+    "pmo",
     "risk manager",
-    "risk",
     "scheduler",
-    "planning",
-    "schedule manager",
+    "planning manager",
+)
+
+MEDIUM_RELEVANCE_TERMS = (
     "project manager",
-    "construction manager",
+    "senior project manager",
+)
+
+GENERIC_PROJECT_MANAGER_CONTEXT_TERMS = (
+    "controls",
+    "contracts",
+    "pmo",
 )
 
 EXCLUDED_RELEVANCE_TERMS = (
@@ -137,7 +142,7 @@ def refresh_existing_relevance(conn: sqlite3.Connection) -> None:
     rows = conn.execute("SELECT id, title FROM job_results").fetchall()
     for row in rows:
         relevance_score, relevance_reason, is_excluded = score_job_relevance(row["title"])
-        if is_excluded or relevance_score < 1:
+        if is_excluded or relevance_score < 2:
             conn.execute("DELETE FROM job_results WHERE id = ?", (row["id"],))
             continue
         conn.execute(
@@ -258,15 +263,30 @@ def score_job_relevance(title: str) -> tuple[int, str, bool]:
         return 0, "No job title found.", False
 
     excluded_terms = [term for term in EXCLUDED_RELEVANCE_TERMS if contains_term(title, term)]
+    strong_terms = [term for term in STRONG_RELEVANCE_TERMS if contains_term(title, term)]
+    medium_terms = [term for term in MEDIUM_RELEVANCE_TERMS if contains_term(title, term)]
+
+    if medium_terms and not strong_terms and not any(term in title for term in GENERIC_PROJECT_MANAGER_CONTEXT_TERMS):
+        return 0, "Generic project manager title without controls, contracts, or PMO context.", False
+
+    score = (len(strong_terms) * 3) + (len(medium_terms) * 1) - (len(excluded_terms) * 3)
+    reasons = []
+    if strong_terms:
+        reasons.append(f"Strong match +3 each: {', '.join(strong_terms)}")
+    if medium_terms:
+        reasons.append(f"Medium match +1 each: {', '.join(medium_terms)}")
     if excluded_terms:
-        return 0, f"Excluded title term: {', '.join(excluded_terms)}.", True
+        reasons.append(f"Exclude terms -3 each: {', '.join(excluded_terms)}")
 
-    matched_terms = [term for term in POSITIVE_RELEVANCE_TERMS if contains_term(title, term)]
-    if not matched_terms:
-        return 0, "No infrastructure, construction, PMO, contracts, controls, risk, scheduling, or planning title terms found.", False
+    if not strong_terms:
+        reason = "; ".join(reasons) if reasons else "No targeted controls, contracts, PMO, risk-manager, scheduler, or planning-manager title terms found."
+        return 0, reason, False
 
-    score = len(matched_terms)
-    return score, f"Matched title terms: {', '.join(matched_terms)}.", False
+    if score < 2:
+        reason = "; ".join(reasons) if reasons else "No targeted controls, contracts, PMO, risk, scheduler, or planning-manager title terms found."
+        return score, reason, False
+
+    return score, "; ".join(reasons), False
 
 
 def calculate_relevance(title: str) -> int:
@@ -495,11 +515,11 @@ def render_search_section(targets: pd.DataFrame) -> None:
     )
     relevance_threshold = st.number_input(
         "Minimum relevance score to save",
-        min_value=1,
-        max_value=len(POSITIVE_RELEVANCE_TERMS),
-        value=1,
+        min_value=2,
+        max_value=12,
+        value=2,
         step=1,
-        help="A job gets 1 point for each positive title term. Excluded title terms are never saved.",
+        help="Strong controls/contracts/PMO matches add 3, generic project manager adds 1, and excluded terms subtract 3.",
     )
 
     disabled = targets.empty or not api_key
