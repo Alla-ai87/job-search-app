@@ -1180,8 +1180,8 @@ def render_settings(results: pd.DataFrame) -> None:
             cv_text = extract_cv_text(cv_file)
             st.session_state["cv_text"] = cv_text
             st.success(f"CV text extracted: {len(cv_text):,} characters.")
-        except Exception as exc:
-            st.error(f"Could not extract CV text: {exc}")
+        except Exception:
+            st.error("Could not read file, please try another format")
     if st.session_state.get("cv_text"):
         st.caption(f"Current CV text loaded: {len(st.session_state['cv_text']):,} characters.")
 
