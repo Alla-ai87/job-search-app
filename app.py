@@ -70,6 +70,9 @@ INFRASTRUCTURE_CONTEXT_TERMS = (
     "wastewater",
     "aviation",
     "airport",
+    "highway",
+    "bridge",
+    "tunnel",
     "design-build",
 )
 
@@ -85,7 +88,7 @@ EXCLUDED_RELEVANCE_TERMS = (
     "data center",
 )
 
-SAVE_RELEVANCE_THRESHOLD = 2
+SAVE_RELEVANCE_THRESHOLD = 1
 
 
 def get_connection() -> sqlite3.Connection:
@@ -248,8 +251,13 @@ def contains_term(text: str, term: str) -> bool:
     return re.search(pattern, text.lower()) is not None
 
 
-def score_job_relevance(title: str) -> tuple[int, str, bool]:
+def score_job_relevance(
+    title: str,
+    description: str = "",
+    include_broader_infrastructure: bool = True,
+) -> tuple[int, str, bool]:
     title = clean_text(title).lower()
+    description = clean_text(description).lower()
     if not title:
         return 0, "No job title found.", False
 
@@ -259,30 +267,34 @@ def score_job_relevance(title: str) -> tuple[int, str, bool]:
 
     strong_terms = [term for term in STRONG_RELEVANCE_TERMS if contains_term(title, term)]
     management_terms = [term for term in INFRASTRUCTURE_MANAGEMENT_TERMS if contains_term(title, term)]
-    context_terms = [term for term in INFRASTRUCTURE_CONTEXT_TERMS if contains_term(title, term)]
+    context_text = f"{title} {description}"
+    context_terms = [term for term in INFRASTRUCTURE_CONTEXT_TERMS if contains_term(context_text, term)]
     has_context = bool(context_terms)
 
     score = len(strong_terms) * 3
     reasons = []
     if strong_terms:
         reasons.append(f"Strong match +3 each: {', '.join(strong_terms)}")
-    if management_terms and has_context:
+    if include_broader_infrastructure and management_terms and has_context:
         score += 1
         reasons.append(f"Infrastructure management role +1: {', '.join(management_terms)}")
         score += 1
         reasons.append(f"Infrastructure context +1: {', '.join(context_terms)}")
     elif management_terms and not strong_terms:
-        reasons.append(f"Management role found but no infrastructure context: {', '.join(management_terms)}")
+        if include_broader_infrastructure:
+            reasons.append(f"Management role found but no infrastructure context: {', '.join(management_terms)}")
+        else:
+            reasons.append("Broader infrastructure management jobs disabled.")
 
-    if not strong_terms and not (management_terms and has_context):
+    if not strong_terms and not (include_broader_infrastructure and management_terms and has_context):
         reason = "; ".join(reasons) if reasons else "No strong match or infrastructure-context management role found."
         return 0, reason, False
 
     return score, "; ".join(reasons), False
 
 
-def calculate_relevance(title: str) -> int:
-    relevance_score, _, is_excluded = score_job_relevance(title)
+def calculate_relevance(title: str, description: str = "", include_broader_infrastructure: bool = True) -> int:
+    relevance_score, _, is_excluded = score_job_relevance(title, description, include_broader_infrastructure)
     if is_excluded:
         return 0
     return relevance_score
@@ -303,6 +315,62 @@ def normalize_job_url(job: dict) -> str:
     return best_apply_link(job)
 
 
+def get_job_id(job: dict) -> str:
+    return clean_text(job.get("job_id") or job.get("id"))
+
+
+def get_employer_name(job: dict) -> str:
+    return clean_text(job.get("company_name") or job.get("employer_name"))
+
+
+def make_job_search_queries(company: str, job_title: str) -> list[str]:
+    return [
+        f"{job_title} {company} jobs United States",
+        f"{job_title} {company} careers",
+        f"{job_title} {company} LinkedIn jobs",
+        f"{job_title} {company} infrastructure jobs",
+        f"{job_title} {company} construction jobs",
+        f"{job_title} {company} rail transit jobs",
+    ]
+
+
+def job_dedupe_keys(job: dict) -> list[tuple[str, str]]:
+    keys = []
+    job_id = get_job_id(job).lower()
+    if job_id:
+        keys.append(("job_id", job_id))
+
+    application_link = best_apply_link(job).lower()
+    if application_link:
+        keys.append(("application_link", application_link))
+
+    title = clean_text(job.get("title")).lower()
+    employer_name = get_employer_name(job).lower()
+    location = clean_text(job.get("location")).lower()
+    title_employer_location = "|".join([title, employer_name, location])
+    if title_employer_location != "||":
+        keys.append(("title_employer_location", title_employer_location))
+    return keys or [("empty", "")]
+
+
+def job_dedupe_key(job: dict) -> tuple[str, str]:
+    return job_dedupe_keys(job)[0]
+
+
+def deduplicate_jobs(jobs: list[dict]) -> tuple[list[dict], int]:
+    seen = set()
+    unique_jobs = []
+    duplicates = 0
+    for job in jobs:
+        keys = job_dedupe_keys(job)
+        if any(key in seen for key in keys):
+            duplicates += 1
+            continue
+        seen.update(keys)
+        unique_jobs.append(job)
+    return unique_jobs, duplicates
+
+
 def get_salary(job: dict) -> str:
     detected = job.get("detected_extensions") or {}
     salary = detected.get("salary")
@@ -314,23 +382,15 @@ def get_salary(job: dict) -> str:
 
 
 def make_result_key(company: str, searched_job_title: str, job: dict) -> str:
-    identity = "|".join(
-        [
-            clean_text(company).lower(),
-            clean_text(searched_job_title).lower(),
-            clean_text(job.get("title")).lower(),
-            clean_text(job.get("company_name") or job.get("employer_name")).lower(),
-            clean_text(job.get("location")).lower(),
-            clean_text(normalize_job_url(job)).lower(),
-        ]
-    )
+    dedupe_type, dedupe_value = job_dedupe_key(job)
+    identity = "|".join([clean_text(company).lower(), clean_text(searched_job_title).lower(), dedupe_type, dedupe_value])
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def search_google_jobs(api_key: str, company: str, job_title: str) -> list[dict]:
+def search_google_jobs_query(api_key: str, query: str) -> list[dict]:
     params = {
         "engine": "google_jobs",
-        "q": f'{job_title} "{company}"',
+        "q": query,
         "hl": "en",
         "gl": "us",
         "api_key": api_key,
@@ -341,6 +401,15 @@ def search_google_jobs(api_key: str, company: str, job_title: str) -> list[dict]
     return payload.get("jobs_results", [])
 
 
+def search_google_jobs(api_key: str, company: str, job_title: str, max_jobs: int) -> tuple[list[dict], int, int]:
+    raw_jobs = []
+    for query in make_job_search_queries(company, job_title):
+        raw_jobs.extend(search_google_jobs_query(api_key, query))
+
+    unique_jobs, duplicates_skipped = deduplicate_jobs(raw_jobs)
+    return unique_jobs[:max_jobs], len(raw_jobs), duplicates_skipped
+
+
 def save_job_results(
     run_id: str,
     run_started_at: str,
@@ -348,6 +417,7 @@ def save_job_results(
     searched_job_title: str,
     jobs: list[dict],
     relevance_threshold: int,
+    include_broader_infrastructure: bool,
 ) -> tuple[int, int]:
     created_at = utc_now()
     inserted = 0
@@ -355,9 +425,10 @@ def save_job_results(
     with get_connection() as conn:
         for job in jobs:
             title = clean_text(job.get("title"))
-            relevance_score = calculate_relevance(title)
+            description = clean_text(job.get("description"))
+            relevance_score = calculate_relevance(title, description, include_broader_infrastructure)
             print("TITLE:", title, "SCORE:", relevance_score)
-            _, relevance_reason, is_excluded = score_job_relevance(title)
+            _, relevance_reason, is_excluded = score_job_relevance(title, description, include_broader_infrastructure)
             if is_excluded:
                 skipped += 1
                 continue
@@ -365,9 +436,8 @@ def save_job_results(
                 skipped += 1
                 continue
 
-            employer_name = clean_text(job.get("company_name") or job.get("employer_name"))
+            employer_name = get_employer_name(job)
             location = clean_text(job.get("location"))
-            description = clean_text(job.get("description"))
             apply_link = best_apply_link(job)
             job_url = normalize_job_url(job)
             sponsorship_status = detect_sponsorship_status(description)
@@ -498,6 +568,19 @@ def render_search_section(targets: pd.DataFrame) -> None:
     if not api_key:
         st.warning("Add SERPAPI_API_KEY to Streamlit secrets before running searches.")
 
+    st.sidebar.header("Search settings")
+    max_jobs_per_target = st.sidebar.slider(
+        "Max jobs per company/title",
+        min_value=3,
+        max_value=20,
+        value=10,
+        step=1,
+    )
+    include_broader_infrastructure = st.sidebar.checkbox(
+        "Include broader infrastructure management jobs",
+        value=True,
+    )
+
     max_targets = st.number_input(
         "Maximum company/title pairs to search this run",
         min_value=1,
@@ -506,6 +589,15 @@ def render_search_section(targets: pd.DataFrame) -> None:
         step=1,
     )
     disabled = targets.empty or not api_key
+    if "last_search_counters" in st.session_state:
+        counters = st.session_state["last_search_counters"]
+        st.caption(f"Last search run: {counters['run_id']}")
+        counter_cols = st.columns(4)
+        counter_cols[0].metric("Total raw jobs found", counters["total_raw_jobs"])
+        counter_cols[1].metric("Duplicates skipped", counters["duplicates_skipped"])
+        counter_cols[2].metric("Excluded by relevance", counters["excluded_by_relevance"])
+        counter_cols[3].metric("Jobs saved", counters["jobs_saved"])
+
     if st.button("Run Job Search", type="primary", disabled=disabled):
         selected_targets = targets.head(int(max_targets))
         run_id = make_run_id()
@@ -513,22 +605,32 @@ def render_search_section(targets: pd.DataFrame) -> None:
         progress = st.progress(0)
         status = st.empty()
         total_inserted = 0
-        total_skipped = 0
+        total_raw_jobs = 0
+        total_duplicates_skipped = 0
+        total_excluded_by_relevance = 0
 
         for index, row in enumerate(selected_targets.itertuples(index=False), start=1):
             status.write(f"Searching {row.job_title} at {row.company}...")
             try:
-                jobs = search_google_jobs(api_key, row.company, row.job_title)
-                inserted, skipped = save_job_results(
+                jobs, raw_jobs_found, duplicates_skipped = search_google_jobs(
+                    api_key,
+                    row.company,
+                    row.job_title,
+                    int(max_jobs_per_target),
+                )
+                inserted, excluded_by_relevance = save_job_results(
                     run_id,
                     run_started_at,
                     row.company,
                     row.job_title,
                     jobs,
                     SAVE_RELEVANCE_THRESHOLD,
+                    include_broader_infrastructure,
                 )
+                total_raw_jobs += raw_jobs_found
+                total_duplicates_skipped += duplicates_skipped
                 total_inserted += inserted
-                total_skipped += skipped
+                total_excluded_by_relevance += excluded_by_relevance
             except requests.HTTPError as exc:
                 st.error(f"SerpAPI error for {row.company} / {row.job_title}: {exc}")
             except requests.RequestException as exc:
@@ -536,10 +638,14 @@ def render_search_section(targets: pd.DataFrame) -> None:
             progress.progress(index / len(selected_targets))
 
         status.write("Search complete.")
-        st.success(
-            f"Saved or updated {total_inserted} relevant job results. "
-            f"Skipped {total_skipped} excluded or low-relevance results."
-        )
+        st.session_state["last_search_counters"] = {
+            "run_id": run_id,
+            "total_raw_jobs": total_raw_jobs,
+            "duplicates_skipped": total_duplicates_skipped,
+            "excluded_by_relevance": total_excluded_by_relevance,
+            "jobs_saved": total_inserted,
+        }
+        st.success("Search complete. Results were saved and the dashboard will refresh.")
         st.rerun()
 
 
