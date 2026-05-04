@@ -10,6 +10,7 @@ This is a Streamlit Cloud app for searching U.S. jobs from an uploaded Excel lis
 - Save search results while skipping duplicates.
 - Filter results for relevant titles before saving.
 - Save a `relevance_score` and `relevance_reason` for each job.
+- Show a `Top 10 best matches` section sorted by relevance, salary, and recency.
 - Filter the dashboard to show only the top 10 highest relevance jobs per search run.
 - Detect sponsorship status as:
   - `sponsorship available`
@@ -118,7 +119,7 @@ These terms reject the job immediately:
 
 Jobs with `relevance_score` below 1 are not saved in new searches. Saved rows include `relevance_reason`, which explains strong matches, infrastructure context, or exclusion reasons.
 
-The dashboard includes optional filters for `Show only top 10 highest relevance jobs per run` and a `Minimum relevance score` slider with a default of 2 and range from 1 to 5. New searches are saved with a run ID so each run can be ranked separately.
+The dashboard includes a `Top 10 best matches` section sorted by `relevance_score`, salary when available, and posting recency from `posted_at`. It also includes optional filters for `Show only top 10 highest relevance jobs per run` and a `Minimum relevance score` slider with a default of 2 and range from 1 to 5. New searches are saved with a run ID so each run can be ranked separately.
 
 ## Search Coverage
 
@@ -140,15 +141,23 @@ Results are deduplicated by job ID, application link, and title/employer/locatio
 
 ## Sponsorship Detection
 
-The app checks the job description for these sponsorship-related signals:
+For new searches, the app checks both job title and description.
+
+Positive phrases mark the job `sponsorship_available`:
 
 - `visa sponsorship`
-- `work authorization`
+- `sponsorship available`
+- `we sponsor`
 - `H1B`
 - `relocation support`
 
-If the description explicitly says `no sponsorship`, the job is marked `sponsorship not available`.
+Negative phrases mark the job `sponsorship_not_available`:
 
-If the description explicitly says `sponsorship provided`, the job is marked `sponsorship available`.
+- `no sponsorship`
+- `not eligible for sponsorship`
+- `must be authorized to work`
+- `no visa support`
 
-Otherwise, the job is marked `not mentioned`.
+If no phrase matches, the job is marked `not_mentioned`.
+
+Saved rows include `sponsorship_reason`, which stores the phrase that triggered the classification. The dashboard can filter to `Show only jobs with possible sponsorship`, and `sponsorship_available` rows are highlighted in green.

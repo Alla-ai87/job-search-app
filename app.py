@@ -16,28 +16,19 @@ DB_PATH = APP_DIR / "job_search.db"
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 
-SPONSORSHIP_SIGNAL_TERMS = (
+SPONSORSHIP_POSITIVE_PHRASES = (
     "visa sponsorship",
-    "work authorization",
-    "h1b",
-    "h-1b",
+    "sponsorship available",
+    "we sponsor",
+    "H1B",
     "relocation support",
 )
 
-SPONSORSHIP_AVAILABLE_PATTERNS = (
-    r"\bsponsorship\s+(is\s+)?provided\b",
-    r"\bvisa\s+sponsorship\s+(is\s+)?provided\b",
-)
-
-SPONSORSHIP_NOT_AVAILABLE_PATTERNS = (
-    r"\bno\s+(visa\s+)?sponsorship\b",
-    "sponsorship is not available",
-    r"\bsponsorship\s+(is\s+)?not\s+available\b",
-    r"\bwithout\s+(visa\s+)?sponsorship\b",
-    r"\b(unable|not\s+able)\s+to\s+sponsor\b",
-    r"\bwill\s+not\s+sponsor\b",
-    r"\b(do|does)\s+not\s+sponsor\b",
-    r"\bcannot\s+sponsor\b",
+SPONSORSHIP_NEGATIVE_PHRASES = (
+    "no sponsorship",
+    "not eligible for sponsorship",
+    "must be authorized to work",
+    "no visa support",
 )
 
 STRONG_RELEVANCE_TERMS = (
@@ -130,6 +121,7 @@ def init_db() -> None:
                 job_url TEXT,
                 apply_link TEXT,
                 sponsorship_status TEXT NOT NULL,
+                sponsorship_reason TEXT,
                 relevance_score INTEGER NOT NULL DEFAULT 0,
                 relevance_reason TEXT,
                 raw_json TEXT,
@@ -137,6 +129,7 @@ def init_db() -> None:
             )
             """
         )
+        ensure_column(conn, "job_results", "sponsorship_reason", "TEXT")
         ensure_column(conn, "job_results", "relevance_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "job_results", "relevance_reason", "TEXT")
         ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
@@ -205,6 +198,7 @@ def get_results() -> pd.DataFrame:
                 schedule_type,
                 salary,
                 sponsorship_status,
+                sponsorship_reason,
                 relevance_score,
                 relevance_reason,
                 job_url,
@@ -234,15 +228,19 @@ def get_serpapi_key() -> str:
         return ""
 
 
-def detect_sponsorship_status(description: object) -> str:
-    text = clean_text(description).lower()
-    if not any(term in text for term in SPONSORSHIP_SIGNAL_TERMS):
-        return "not mentioned"
-    if any(re.search(pattern, text) for pattern in SPONSORSHIP_NOT_AVAILABLE_PATTERNS):
-        return "sponsorship not available"
-    if any(re.search(pattern, text) for pattern in SPONSORSHIP_AVAILABLE_PATTERNS):
-        return "sponsorship available"
-    return "not mentioned"
+def phrase_in_text(text: str, phrase: str) -> bool:
+    return phrase.lower() in text.lower()
+
+
+def detect_sponsorship_status(title: object, description: object) -> tuple[str, str]:
+    text = " ".join([clean_text(title), clean_text(description)]).lower()
+    for phrase in SPONSORSHIP_POSITIVE_PHRASES:
+        if phrase_in_text(text, phrase):
+            return "sponsorship_available", phrase
+    for phrase in SPONSORSHIP_NEGATIVE_PHRASES:
+        if phrase_in_text(text, phrase):
+            return "sponsorship_not_available", phrase
+    return "not_mentioned", ""
 
 
 def contains_term(text: str, term: str) -> bool:
@@ -440,7 +438,7 @@ def save_job_results(
             location = clean_text(job.get("location"))
             apply_link = best_apply_link(job)
             job_url = normalize_job_url(job)
-            sponsorship_status = detect_sponsorship_status(description)
+            sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description)
 
             cursor = conn.execute(
                 """
@@ -461,12 +459,13 @@ def save_job_results(
                     job_url,
                     apply_link,
                     sponsorship_status,
+                    sponsorship_reason,
                     relevance_score,
                     relevance_reason,
                     raw_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(result_key) DO UPDATE SET
                     run_id = excluded.run_id,
                     run_started_at = excluded.run_started_at,
@@ -483,6 +482,7 @@ def save_job_results(
                     job_url = excluded.job_url,
                     apply_link = excluded.apply_link,
                     sponsorship_status = excluded.sponsorship_status,
+                    sponsorship_reason = excluded.sponsorship_reason,
                     relevance_score = excluded.relevance_score,
                     relevance_reason = excluded.relevance_reason,
                     raw_json = excluded.raw_json,
@@ -505,6 +505,7 @@ def save_job_results(
                     job_url,
                     apply_link,
                     sponsorship_status,
+                    sponsorship_reason,
                     relevance_score,
                     relevance_reason,
                     json.dumps(job),
@@ -526,6 +527,72 @@ def top_jobs_per_run(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
     return sorted_df.groupby("run_id", dropna=False, group_keys=False).head(limit)
 
 
+def parse_salary_value(salary: object) -> float:
+    text = clean_text(salary).lower()
+    if not text:
+        return 0.0
+
+    values = []
+    for raw_value in re.findall(r"\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kKmM]?)", text):
+        number_text, suffix = raw_value
+        try:
+            value = float(number_text.replace(",", ""))
+        except ValueError:
+            continue
+        if suffix.lower() == "k":
+            value *= 1_000
+        elif suffix.lower() == "m":
+            value *= 1_000_000
+        values.append(value)
+
+    return max(values) if values else 0.0
+
+
+def parse_recency_score(posted_at: object, created_at: object) -> float:
+    text = clean_text(posted_at).lower()
+    if "today" in text or "just posted" in text or "hour" in text or "minute" in text:
+        return 10_000.0
+    if "yesterday" in text:
+        return 9_999.0
+
+    match = re.search(r"(\d+)\s+(day|week|month|year)", text)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        days = amount
+        if unit == "week":
+            days *= 7
+        elif unit == "month":
+            days *= 30
+        elif unit == "year":
+            days *= 365
+        return max(0.0, 10_000.0 - days)
+
+    parsed_created_at = pd.to_datetime(clean_text(created_at), errors="coerce", utc=True)
+    if pd.isna(parsed_created_at):
+        return 0.0
+    now = pd.Timestamp.now(tz="UTC")
+    age_days = max(0.0, (now - parsed_created_at).total_seconds() / 86400)
+    return max(0.0, 10_000.0 - age_days)
+
+
+def top_best_matches(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
+    if df.empty:
+        return df
+    ranked = df.copy()
+    ranked["_salary_sort"] = ranked["salary"].map(parse_salary_value)
+    ranked["_recency_sort"] = ranked.apply(
+        lambda row: parse_recency_score(row.get("posted_at"), row.get("created_at")),
+        axis=1,
+    )
+    ranked = ranked.sort_values(
+        by=["relevance_score", "_salary_sort", "_recency_sort"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+    return ranked.head(limit).drop(columns=["_salary_sort", "_recency_sort"], errors="ignore")
+
+
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     from io import BytesIO
 
@@ -533,6 +600,16 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="job_results")
     return output.getvalue()
+
+
+def is_sponsorship_available_status(status: object) -> bool:
+    return clean_text(status) in {"sponsorship_available", "sponsorship available"}
+
+
+def highlight_sponsorship_available(row: pd.Series) -> list[str]:
+    if is_sponsorship_available_status(row.get("sponsorship_status")):
+        return ["background-color: #d1fae5"] * len(row)
+    return [""] * len(row)
 
 
 def render_upload_section() -> None:
@@ -658,24 +735,28 @@ def render_dashboard(results: pd.DataFrame) -> None:
     col1, col2, col3 = st.columns(3)
     col1.metric("Saved jobs", len(results))
     col2.metric("Companies", results["company"].nunique())
-    col3.metric("Sponsorship available", (results["sponsorship_status"] == "sponsorship available").sum())
+    col3.metric("Sponsorship available", results["sponsorship_status"].map(is_sponsorship_available_status).sum())
     st.caption(
         "New searches save jobs with relevance_score >= 2. Strong controls/contracts/PMO matches score highest; "
         "infrastructure management titles need sector context."
     )
 
+    sponsorship_options = [
+        "sponsorship_available",
+        "sponsorship_not_available",
+        "not_mentioned",
+        "sponsorship available",
+        "sponsorship not available",
+        "not mentioned",
+    ]
     sponsorship_filter = st.multiselect(
         "Sponsorship status",
-        options=[
-            "sponsorship available",
-            "sponsorship not available",
-            "not mentioned",
-        ],
-        default=[
-            "sponsorship available",
-            "sponsorship not available",
-            "not mentioned",
-        ],
+        options=sponsorship_options,
+        default=sponsorship_options,
+    )
+    possible_sponsorship_only = st.checkbox(
+        "Show only jobs with possible sponsorship",
+        value=False,
     )
     company_filter = st.multiselect(
         "Company",
@@ -694,22 +775,43 @@ def render_dashboard(results: pd.DataFrame) -> None:
     )
 
     filtered = results[results["sponsorship_status"].isin(sponsorship_filter)]
+    if possible_sponsorship_only:
+        filtered = filtered[filtered["sponsorship_status"].map(is_sponsorship_available_status)]
     if company_filter:
         filtered = filtered[filtered["company"].isin(company_filter)]
     filtered = filtered[filtered["relevance_score"] >= minimum_relevance_score]
     if top_10_per_run:
         filtered = top_jobs_per_run(filtered, limit=10)
 
+    table_column_config = {
+        "job_url": st.column_config.LinkColumn("Job URL"),
+        "apply_link": st.column_config.LinkColumn("Apply link"),
+        "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
+        "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
+        "description": st.column_config.TextColumn("Description", width="large"),
+    }
+
+    st.subheader("Top 10 best matches")
+    top_matches = top_best_matches(filtered, limit=10)
+    if top_matches.empty:
+        st.info("No jobs match the current filters.")
+    else:
+        st.caption("Sorted by relevance score, salary when available, then posting recency.")
+        styled_top_matches = top_matches.style.apply(highlight_sponsorship_available, axis=1)
+        st.dataframe(
+            styled_top_matches,
+            use_container_width=True,
+            hide_index=True,
+            column_config=table_column_config,
+        )
+
+    st.subheader("All matching jobs")
+    styled_filtered = filtered.style.apply(highlight_sponsorship_available, axis=1)
     st.dataframe(
-        filtered,
+        styled_filtered,
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "job_url": st.column_config.LinkColumn("Job URL"),
-            "apply_link": st.column_config.LinkColumn("Apply link"),
-            "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
-            "description": st.column_config.TextColumn("Description", width="large"),
-        },
+        column_config=table_column_config,
     )
 
     st.download_button(
