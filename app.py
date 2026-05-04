@@ -124,12 +124,30 @@ def init_db() -> None:
         ensure_column(conn, "job_results", "relevance_reason", "TEXT")
         ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
         ensure_column(conn, "job_results", "run_started_at", "TEXT")
+        refresh_existing_relevance(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def refresh_existing_relevance(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT id, title FROM job_results").fetchall()
+    for row in rows:
+        relevance_score, relevance_reason, is_excluded = score_job_relevance(row["title"])
+        if is_excluded or relevance_score < 1:
+            conn.execute("DELETE FROM job_results WHERE id = ?", (row["id"],))
+            continue
+        conn.execute(
+            """
+            UPDATE job_results
+            SET relevance_score = ?, relevance_reason = ?
+            WHERE id = ?
+            """,
+            (relevance_score, relevance_reason, row["id"]),
+        )
 
 
 def clean_text(value: object) -> str:
@@ -251,6 +269,13 @@ def score_job_relevance(title: str) -> tuple[int, str, bool]:
     return score, f"Matched title terms: {', '.join(matched_terms)}.", False
 
 
+def calculate_relevance(title: str) -> int:
+    relevance_score, _, is_excluded = score_job_relevance(title)
+    if is_excluded:
+        return 0
+    return relevance_score
+
+
 def best_apply_link(job: dict) -> str:
     apply_options = job.get("apply_options") or []
     if apply_options:
@@ -318,7 +343,9 @@ def save_job_results(
     with get_connection() as conn:
         for job in jobs:
             title = clean_text(job.get("title"))
-            relevance_score, relevance_reason, is_excluded = score_job_relevance(title)
+            relevance_score = calculate_relevance(title)
+            print("TITLE:", title, "SCORE:", relevance_score)
+            _, relevance_reason, is_excluded = score_job_relevance(title)
             if is_excluded:
                 skipped += 1
                 continue
@@ -335,7 +362,7 @@ def save_job_results(
 
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO job_results (
+                INSERT INTO job_results (
                     result_key,
                     run_id,
                     run_started_at,
@@ -358,6 +385,26 @@ def save_job_results(
                     created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(result_key) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    run_started_at = excluded.run_started_at,
+                    company = excluded.company,
+                    searched_job_title = excluded.searched_job_title,
+                    title = excluded.title,
+                    employer_name = excluded.employer_name,
+                    location = excluded.location,
+                    via = excluded.via,
+                    posted_at = excluded.posted_at,
+                    schedule_type = excluded.schedule_type,
+                    salary = excluded.salary,
+                    description = excluded.description,
+                    job_url = excluded.job_url,
+                    apply_link = excluded.apply_link,
+                    sponsorship_status = excluded.sponsorship_status,
+                    relevance_score = excluded.relevance_score,
+                    relevance_reason = excluded.relevance_reason,
+                    raw_json = excluded.raw_json,
+                    created_at = excluded.created_at
                 """,
                 (
                     make_result_key(company, searched_job_title, job),
@@ -487,8 +534,8 @@ def render_search_section(targets: pd.DataFrame) -> None:
 
         status.write("Search complete.")
         st.success(
-            f"Saved {total_inserted} new job results. "
-            f"Skipped {total_skipped} low-relevance results. Duplicates were skipped."
+            f"Saved or updated {total_inserted} relevant job results. "
+            f"Skipped {total_skipped} excluded or low-relevance results."
         )
         st.rerun()
 
