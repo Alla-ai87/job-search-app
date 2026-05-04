@@ -1,6 +1,8 @@
 import hashlib
 import json
+import re
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,30 +16,47 @@ DB_PATH = APP_DIR / "job_search.db"
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
 
 
-SPONSORSHIP_AVAILABLE_TERMS = (
+SPONSORSHIP_SIGNAL_TERMS = (
     "visa sponsorship",
-    "sponsorship available",
-    "will sponsor",
-    "h-1b sponsorship",
-    "h1b sponsorship",
-    "sponsor visas",
-    "sponsor work visas",
-    "employment visa sponsorship",
-    "work authorization sponsorship",
+    "work authorization",
+    "h1b",
+    "h-1b",
+    "relocation support",
 )
 
-SPONSORSHIP_NOT_AVAILABLE_TERMS = (
-    "no visa sponsorship",
-    "without sponsorship",
+SPONSORSHIP_AVAILABLE_PATTERNS = (
+    r"\bsponsorship\s+(is\s+)?provided\b",
+    r"\bvisa\s+sponsorship\s+(is\s+)?provided\b",
+)
+
+SPONSORSHIP_NOT_AVAILABLE_PATTERNS = (
+    r"\bno\s+(visa\s+)?sponsorship\b",
     "sponsorship is not available",
-    "unable to sponsor",
-    "will not sponsor",
-    "does not sponsor",
-    "do not sponsor",
-    "must be authorized to work",
-    "must be legally authorized",
-    "now or in the future",
-    "require sponsorship now or in the future",
+    r"\bsponsorship\s+(is\s+)?not\s+available\b",
+    r"\bwithout\s+(visa\s+)?sponsorship\b",
+    r"\b(unable|not\s+able)\s+to\s+sponsor\b",
+    r"\bwill\s+not\s+sponsor\b",
+    r"\b(do|does)\s+not\s+sponsor\b",
+    r"\bcannot\s+sponsor\b",
+)
+
+RELEVANT_TITLE_TERMS = (
+    "Contract",
+    "PMO",
+    "Project Controls",
+    "Program Controls",
+    "Risk",
+    "Planning",
+    "Scheduler",
+)
+
+EXCLUDED_TITLE_TERMS = (
+    "Engineer",
+    "Developer",
+    "Architect",
+    "IT",
+    "Software",
+    "Network",
 )
 
 
@@ -65,6 +84,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS job_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 result_key TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL DEFAULT 'legacy',
+                run_started_at TEXT,
                 company TEXT NOT NULL,
                 searched_job_title TEXT NOT NULL,
                 title TEXT,
@@ -78,11 +99,21 @@ def init_db() -> None:
                 job_url TEXT,
                 apply_link TEXT,
                 sponsorship_status TEXT NOT NULL,
+                relevance_score INTEGER NOT NULL DEFAULT 0,
                 raw_json TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        ensure_column(conn, "job_results", "relevance_score", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
+        ensure_column(conn, "job_results", "run_started_at", "TEXT")
+
+
+def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 
 def clean_text(value: object) -> str:
@@ -129,6 +160,8 @@ def get_results() -> pd.DataFrame:
         return pd.read_sql_query(
             """
             SELECT
+                run_id,
+                run_started_at,
                 company,
                 searched_job_title,
                 title,
@@ -139,12 +172,13 @@ def get_results() -> pd.DataFrame:
                 schedule_type,
                 salary,
                 sponsorship_status,
+                relevance_score,
                 job_url,
                 apply_link,
                 description,
                 created_at
             FROM job_results
-            ORDER BY created_at DESC, company, searched_job_title
+            ORDER BY COALESCE(run_started_at, created_at) DESC, relevance_score DESC, company, searched_job_title
             """,
             conn,
         )
@@ -154,6 +188,11 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def make_run_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return f"run-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
 def get_serpapi_key() -> str:
     try:
         return st.secrets["SERPAPI_API_KEY"]
@@ -161,13 +200,31 @@ def get_serpapi_key() -> str:
         return ""
 
 
-def detect_sponsorship_status(*text_parts: object) -> str:
-    text = " ".join(clean_text(part).lower() for part in text_parts if clean_text(part))
-    if any(term in text for term in SPONSORSHIP_NOT_AVAILABLE_TERMS):
+def detect_sponsorship_status(description: object) -> str:
+    text = clean_text(description).lower()
+    if not any(term in text for term in SPONSORSHIP_SIGNAL_TERMS):
+        return "not mentioned"
+    if any(re.search(pattern, text) for pattern in SPONSORSHIP_NOT_AVAILABLE_PATTERNS):
         return "sponsorship not available"
-    if any(term in text for term in SPONSORSHIP_AVAILABLE_TERMS):
+    if any(re.search(pattern, text) for pattern in SPONSORSHIP_AVAILABLE_PATTERNS):
         return "sponsorship available"
     return "not mentioned"
+
+
+def contains_term(text: str, term: str) -> bool:
+    escaped_words = [re.escape(word) for word in term.lower().split()]
+    pattern = r"\b" + r"\s+".join(escaped_words) + r"\b"
+    return re.search(pattern, text.lower()) is not None
+
+
+def calculate_relevance_score(title: str) -> int:
+    title = clean_text(title)
+    if not title:
+        return 0
+    if any(contains_term(title, term) for term in EXCLUDED_TITLE_TERMS):
+        return 0
+    matched_terms = [term for term in RELEVANT_TITLE_TERMS if contains_term(title, term)]
+    return len(matched_terms)
 
 
 def best_apply_link(job: dict) -> str:
@@ -223,29 +280,38 @@ def search_google_jobs(api_key: str, company: str, job_title: str) -> list[dict]
     return payload.get("jobs_results", [])
 
 
-def save_job_results(company: str, searched_job_title: str, jobs: list[dict]) -> int:
+def save_job_results(
+    run_id: str,
+    run_started_at: str,
+    company: str,
+    searched_job_title: str,
+    jobs: list[dict],
+    relevance_threshold: int,
+) -> tuple[int, int]:
     created_at = utc_now()
     inserted = 0
+    skipped = 0
     with get_connection() as conn:
         for job in jobs:
             title = clean_text(job.get("title"))
+            relevance_score = calculate_relevance_score(title)
+            if relevance_score < relevance_threshold:
+                skipped += 1
+                continue
+
             employer_name = clean_text(job.get("company_name") or job.get("employer_name"))
             location = clean_text(job.get("location"))
             description = clean_text(job.get("description"))
             apply_link = best_apply_link(job)
             job_url = normalize_job_url(job)
-            sponsorship_status = detect_sponsorship_status(
-                title,
-                employer_name,
-                description,
-                " ".join(job.get("extensions") or []),
-                " ".join(option.get("title", "") for option in job.get("apply_options") or []),
-            )
+            sponsorship_status = detect_sponsorship_status(description)
 
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO job_results (
                     result_key,
+                    run_id,
+                    run_started_at,
                     company,
                     searched_job_title,
                     title,
@@ -259,13 +325,16 @@ def save_job_results(company: str, searched_job_title: str, jobs: list[dict]) ->
                     job_url,
                     apply_link,
                     sponsorship_status,
+                    relevance_score,
                     raw_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     make_result_key(company, searched_job_title, job),
+                    run_id,
+                    run_started_at,
                     company,
                     searched_job_title,
                     title,
@@ -279,12 +348,24 @@ def save_job_results(company: str, searched_job_title: str, jobs: list[dict]) ->
                     job_url,
                     apply_link,
                     sponsorship_status,
+                    relevance_score,
                     json.dumps(job),
                     created_at,
                 ),
             )
             inserted += cursor.rowcount
-    return inserted
+    return inserted, skipped
+
+
+def top_jobs_per_run(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
+    if df.empty:
+        return df
+    sorted_df = df.sort_values(
+        by=["run_started_at", "created_at", "relevance_score"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+    return sorted_df.groupby("run_id", dropna=False, group_keys=False).head(limit)
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -336,19 +417,39 @@ def render_search_section(targets: pd.DataFrame) -> None:
         value=min(10, max(1, len(targets))),
         step=1,
     )
+    relevance_threshold = st.number_input(
+        "Minimum relevance score to save",
+        min_value=1,
+        max_value=len(RELEVANT_TITLE_TERMS),
+        value=1,
+        step=1,
+        help="A job gets 1 point for each allowed term found in the job title. Excluded terms always score 0.",
+    )
 
     disabled = targets.empty or not api_key
     if st.button("Run Job Search", type="primary", disabled=disabled):
         selected_targets = targets.head(int(max_targets))
+        run_id = make_run_id()
+        run_started_at = utc_now()
         progress = st.progress(0)
         status = st.empty()
         total_inserted = 0
+        total_skipped = 0
 
         for index, row in enumerate(selected_targets.itertuples(index=False), start=1):
             status.write(f"Searching {row.job_title} at {row.company}...")
             try:
                 jobs = search_google_jobs(api_key, row.company, row.job_title)
-                total_inserted += save_job_results(row.company, row.job_title, jobs)
+                inserted, skipped = save_job_results(
+                    run_id,
+                    run_started_at,
+                    row.company,
+                    row.job_title,
+                    jobs,
+                    int(relevance_threshold),
+                )
+                total_inserted += inserted
+                total_skipped += skipped
             except requests.HTTPError as exc:
                 st.error(f"SerpAPI error for {row.company} / {row.job_title}: {exc}")
             except requests.RequestException as exc:
@@ -356,7 +457,10 @@ def render_search_section(targets: pd.DataFrame) -> None:
             progress.progress(index / len(selected_targets))
 
         status.write("Search complete.")
-        st.success(f"Saved {total_inserted} new job results. Duplicates were skipped.")
+        st.success(
+            f"Saved {total_inserted} new job results. "
+            f"Skipped {total_skipped} low-relevance results. Duplicates were skipped."
+        )
         st.rerun()
 
 
@@ -370,6 +474,10 @@ def render_dashboard(results: pd.DataFrame) -> None:
     col1.metric("Saved jobs", len(results))
     col2.metric("Companies", results["company"].nunique())
     col3.metric("Sponsorship available", (results["sponsorship_status"] == "sponsorship available").sum())
+    st.caption(
+        "Saved jobs must include at least one allowed title term and no excluded title terms. "
+        "Relevance score is the count of allowed terms matched in the title."
+    )
 
     sponsorship_filter = st.multiselect(
         "Sponsorship status",
@@ -388,10 +496,16 @@ def render_dashboard(results: pd.DataFrame) -> None:
         "Company",
         options=sorted(results["company"].dropna().unique()),
     )
+    top_10_per_run = st.checkbox(
+        "Show only top 10 highest relevance jobs per run",
+        value=False,
+    )
 
     filtered = results[results["sponsorship_status"].isin(sponsorship_filter)]
     if company_filter:
         filtered = filtered[filtered["company"].isin(company_filter)]
+    if top_10_per_run:
+        filtered = top_jobs_per_run(filtered, limit=10)
 
     st.dataframe(
         filtered,
