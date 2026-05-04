@@ -1,9 +1,13 @@
 import hashlib
+from io import BytesIO
 import json
 import re
+import smtplib
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +26,13 @@ SPONSORSHIP_POSITIVE_PHRASES = (
     "we sponsor",
     "H1B",
     "relocation support",
+)
+
+SPONSORSHIP_AUTHORIZATION_PHRASES = (
+    "work authorization",
+    "authorized to work",
+    "work permit",
+    "employment authorization",
 )
 
 SPONSORSHIP_NEGATIVE_PHRASES = (
@@ -81,6 +92,8 @@ EXCLUDED_RELEVANCE_TERMS = (
 
 SAVE_RELEVANCE_THRESHOLD = 1
 
+APPLICATION_STATUSES = ("New", "Interested", "Applied", "Rejected", "Interview", "Archived")
+
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -124,6 +137,10 @@ def init_db() -> None:
                 sponsorship_reason TEXT,
                 relevance_score INTEGER NOT NULL DEFAULT 0,
                 relevance_reason TEXT,
+                cv_match_score INTEGER NOT NULL DEFAULT 0,
+                cv_match_reason TEXT,
+                status TEXT NOT NULL DEFAULT 'New',
+                notes TEXT DEFAULT '',
                 raw_json TEXT,
                 created_at TEXT NOT NULL
             )
@@ -132,8 +149,24 @@ def init_db() -> None:
         ensure_column(conn, "job_results", "sponsorship_reason", "TEXT")
         ensure_column(conn, "job_results", "relevance_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "job_results", "relevance_reason", "TEXT")
+        ensure_column(conn, "job_results", "cv_match_score", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "job_results", "cv_match_reason", "TEXT")
+        ensure_column(conn, "job_results", "status", "TEXT NOT NULL DEFAULT 'New'")
+        ensure_column(conn, "job_results", "notes", "TEXT DEFAULT ''")
         ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
         ensure_column(conn, "job_results", "run_started_at", "TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_runs (
+                run_id TEXT PRIMARY KEY,
+                run_started_at TEXT NOT NULL,
+                raw_jobs_found INTEGER NOT NULL DEFAULT 0,
+                duplicates_skipped INTEGER NOT NULL DEFAULT 0,
+                excluded_by_relevance INTEGER NOT NULL DEFAULT 0,
+                jobs_saved INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
 
 
 def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
@@ -186,6 +219,7 @@ def get_results() -> pd.DataFrame:
         return pd.read_sql_query(
             """
             SELECT
+                id,
                 run_id,
                 run_started_at,
                 company,
@@ -201,6 +235,10 @@ def get_results() -> pd.DataFrame:
                 sponsorship_reason,
                 relevance_score,
                 relevance_reason,
+                cv_match_score,
+                cv_match_reason,
+                status,
+                notes,
                 job_url,
                 apply_link,
                 description,
@@ -209,6 +247,65 @@ def get_results() -> pd.DataFrame:
             ORDER BY COALESCE(run_started_at, created_at) DESC, relevance_score DESC, company, searched_job_title
             """,
             conn,
+        )
+
+
+def get_search_runs() -> pd.DataFrame:
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            """
+            SELECT
+                run_id,
+                run_started_at,
+                raw_jobs_found,
+                duplicates_skipped,
+                excluded_by_relevance,
+                jobs_saved
+            FROM search_runs
+            ORDER BY run_started_at DESC
+            """,
+            conn,
+        )
+
+
+def save_search_run(
+    run_id: str,
+    run_started_at: str,
+    raw_jobs_found: int,
+    duplicates_skipped: int,
+    excluded_by_relevance: int,
+    jobs_saved: int,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO search_runs (
+                run_id,
+                run_started_at,
+                raw_jobs_found,
+                duplicates_skipped,
+                excluded_by_relevance,
+                jobs_saved
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                run_started_at = excluded.run_started_at,
+                raw_jobs_found = excluded.raw_jobs_found,
+                duplicates_skipped = excluded.duplicates_skipped,
+                excluded_by_relevance = excluded.excluded_by_relevance,
+                jobs_saved = excluded.jobs_saved
+            """,
+            (run_id, run_started_at, raw_jobs_found, duplicates_skipped, excluded_by_relevance, jobs_saved),
+        )
+
+
+def update_job_tracking(job_id: int, status: str, notes: str) -> None:
+    if status not in APPLICATION_STATUSES:
+        status = "New"
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE job_results SET status = ?, notes = ? WHERE id = ?",
+            (status, notes, job_id),
         )
 
 
@@ -232,15 +329,29 @@ def phrase_in_text(text: str, phrase: str) -> bool:
     return phrase.lower() in text.lower()
 
 
-def detect_sponsorship_status(title: object, description: object) -> tuple[str, str]:
-    text = " ".join([clean_text(title), clean_text(description)]).lower()
+def collect_application_text(job: dict) -> str:
+    apply_options = job.get("apply_options") or []
+    related_links = job.get("related_links") or []
+    parts = []
+    for option in apply_options:
+        parts.extend([clean_text(option.get("title")), clean_text(option.get("link"))])
+    for link in related_links:
+        parts.extend([clean_text(link.get("text")), clean_text(link.get("link"))])
+    return " ".join(part for part in parts if part)
+
+
+def detect_sponsorship_status(title: object, description: object, application_text: object = "") -> tuple[str, str]:
+    text = " ".join([clean_text(title), clean_text(description), clean_text(application_text)]).lower()
     for phrase in SPONSORSHIP_POSITIVE_PHRASES:
         if phrase_in_text(text, phrase):
-            return "sponsorship_available", phrase
+            return "sponsorship available", phrase
     for phrase in SPONSORSHIP_NEGATIVE_PHRASES:
         if phrase_in_text(text, phrase):
-            return "sponsorship_not_available", phrase
-    return "not_mentioned", ""
+            return "sponsorship not available", phrase
+    for phrase in SPONSORSHIP_AUTHORIZATION_PHRASES:
+        if phrase_in_text(text, phrase):
+            return "requires work authorization", phrase
+    return "not mentioned", ""
 
 
 def contains_term(text: str, term: str) -> bool:
@@ -296,6 +407,82 @@ def calculate_relevance(title: str, description: str = "", include_broader_infra
     if is_excluded:
         return 0
     return relevance_score
+
+
+CV_STOPWORDS = {
+    "and",
+    "the",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "your",
+    "you",
+    "are",
+    "was",
+    "were",
+    "have",
+    "has",
+    "job",
+    "role",
+    "work",
+    "team",
+    "will",
+    "our",
+    "their",
+    "they",
+    "a",
+    "an",
+    "of",
+    "to",
+    "in",
+    "on",
+    "by",
+    "or",
+    "as",
+    "at",
+}
+
+
+def tokenize_for_match(text: str) -> set[str]:
+    tokens = set(re.findall(r"[a-zA-Z][a-zA-Z0-9+-]{2,}", clean_text(text).lower()))
+    return {token for token in tokens if token not in CV_STOPWORDS}
+
+
+def extract_cv_text(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+    suffix = Path(uploaded_file.name).suffix.lower()
+    data = uploaded_file.getvalue()
+    if suffix == ".pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if suffix == ".docx":
+        from docx import Document
+
+        document = Document(BytesIO(data))
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+    return ""
+
+
+def calculate_cv_match(title: str, description: str, cv_text: str) -> tuple[int, str]:
+    cv_tokens = tokenize_for_match(cv_text)
+    job_tokens = tokenize_for_match(f"{title} {description}")
+    if not cv_tokens:
+        return 0, "No CV uploaded."
+    if not job_tokens:
+        return 0, "No job text available for CV comparison."
+
+    matched_tokens = sorted(job_tokens & cv_tokens)
+    coverage = len(matched_tokens) / max(1, len(job_tokens))
+    score = min(100, round(coverage * 100))
+    if not matched_tokens:
+        return 0, "No meaningful overlap with CV keywords."
+    preview = ", ".join(matched_tokens[:12])
+    return score, f"Matched CV keywords: {preview}"
 
 
 def best_apply_link(job: dict) -> str:
@@ -416,6 +603,7 @@ def save_job_results(
     jobs: list[dict],
     relevance_threshold: int,
     include_broader_infrastructure: bool,
+    cv_text: str = "",
 ) -> tuple[int, int]:
     created_at = utc_now()
     inserted = 0
@@ -438,7 +626,9 @@ def save_job_results(
             location = clean_text(job.get("location"))
             apply_link = best_apply_link(job)
             job_url = normalize_job_url(job)
-            sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description)
+            application_text = collect_application_text(job)
+            sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
+            cv_match_score, cv_match_reason = calculate_cv_match(title, description, cv_text)
 
             cursor = conn.execute(
                 """
@@ -462,10 +652,14 @@ def save_job_results(
                     sponsorship_reason,
                     relevance_score,
                     relevance_reason,
+                    cv_match_score,
+                    cv_match_reason,
+                    status,
+                    notes,
                     raw_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(result_key) DO UPDATE SET
                     run_id = excluded.run_id,
                     run_started_at = excluded.run_started_at,
@@ -485,6 +679,8 @@ def save_job_results(
                     sponsorship_reason = excluded.sponsorship_reason,
                     relevance_score = excluded.relevance_score,
                     relevance_reason = excluded.relevance_reason,
+                    cv_match_score = excluded.cv_match_score,
+                    cv_match_reason = excluded.cv_match_reason,
                     raw_json = excluded.raw_json,
                     created_at = excluded.created_at
                 """,
@@ -508,6 +704,10 @@ def save_job_results(
                     sponsorship_reason,
                     relevance_score,
                     relevance_reason,
+                    cv_match_score,
+                    cv_match_reason,
+                    "New",
+                    "",
                     json.dumps(job),
                     created_at,
                 ),
@@ -581,13 +781,15 @@ def top_best_matches(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
         return df
     ranked = df.copy()
     ranked["_salary_sort"] = ranked["salary"].map(parse_salary_value)
+    if "cv_match_score" not in ranked.columns:
+        ranked["cv_match_score"] = 0
     ranked["_recency_sort"] = ranked.apply(
         lambda row: parse_recency_score(row.get("posted_at"), row.get("created_at")),
         axis=1,
     )
     ranked = ranked.sort_values(
-        by=["relevance_score", "_salary_sort", "_recency_sort"],
-        ascending=[False, False, False],
+        by=["relevance_score", "cv_match_score", "_salary_sort", "_recency_sort"],
+        ascending=[False, False, False, False],
         na_position="last",
     )
     return ranked.head(limit).drop(columns=["_salary_sort", "_recency_sort"], errors="ignore")
@@ -600,6 +802,88 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="job_results")
     return output.getvalue()
+
+
+EXPORT_COLUMNS = [
+    "company",
+    "searched_job_title",
+    "title",
+    "employer_name",
+    "location",
+    "salary",
+    "posted_at",
+    "sponsorship_status",
+    "sponsorship_reason",
+    "relevance_score",
+    "relevance_reason",
+    "cv_match_score",
+    "cv_match_reason",
+    "status",
+    "notes",
+    "apply_link",
+]
+
+
+def export_results_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    export_df = df.copy()
+    for column in EXPORT_COLUMNS:
+        if column not in export_df.columns:
+            export_df[column] = ""
+    return dataframe_to_excel_bytes(export_df[EXPORT_COLUMNS])
+
+
+def build_email_body(top_matches: pd.DataFrame) -> str:
+    if top_matches.empty:
+        return "No matching jobs are currently saved."
+
+    lines = ["Top 10 best job matches", ""]
+    for index, row in enumerate(top_matches.itertuples(index=False), start=1):
+        lines.extend(
+            [
+                f"{index}. {clean_text(getattr(row, 'title', ''))}",
+                f"Company: {clean_text(getattr(row, 'company', ''))}",
+                f"Location: {clean_text(getattr(row, 'location', ''))}",
+                f"Relevance: {clean_text(getattr(row, 'relevance_score', ''))}",
+                f"CV match: {clean_text(getattr(row, 'cv_match_score', ''))}",
+                f"Sponsorship: {clean_text(getattr(row, 'sponsorship_status', ''))}",
+                f"Salary: {clean_text(getattr(row, 'salary', ''))}",
+                f"Apply: {clean_text(getattr(row, 'apply_link', ''))}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def send_email_summary(recipient_email: str, top_matches: pd.DataFrame) -> tuple[bool, str]:
+    try:
+        smtp_host = st.secrets["SMTP_HOST"]
+        smtp_port = int(st.secrets.get("SMTP_PORT", 587))
+        smtp_user = st.secrets["SMTP_USERNAME"]
+        smtp_password = st.secrets["SMTP_PASSWORD"]
+        smtp_sender = st.secrets.get("SMTP_SENDER", smtp_user)
+    except Exception:
+        return False, "Missing SMTP secrets. Add SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, and optionally SMTP_SENDER."
+
+    message = MIMEMultipart()
+    message["From"] = smtp_sender
+    message["To"] = recipient_email
+    message["Subject"] = "Daily Job Search Top 10 Summary"
+    message.attach(MIMEText(build_email_body(top_matches), "plain"))
+
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as server:
+                server.login(smtp_user, smtp_password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.send_message(message)
+    except Exception as exc:
+        return False, f"Email failed: {exc}"
+
+    return True, "Email summary sent."
 
 
 def is_sponsorship_available_status(status: object) -> bool:
@@ -703,6 +987,7 @@ def render_search_section(targets: pd.DataFrame) -> None:
                     jobs,
                     SAVE_RELEVANCE_THRESHOLD,
                     include_broader_infrastructure,
+                    st.session_state.get("cv_text", ""),
                 )
                 total_raw_jobs += raw_jobs_found
                 total_duplicates_skipped += duplicates_skipped
@@ -722,6 +1007,14 @@ def render_search_section(targets: pd.DataFrame) -> None:
             "excluded_by_relevance": total_excluded_by_relevance,
             "jobs_saved": total_inserted,
         }
+        save_search_run(
+            run_id,
+            run_started_at,
+            total_raw_jobs,
+            total_duplicates_skipped,
+            total_excluded_by_relevance,
+            total_inserted,
+        )
         st.success("Search complete. Results were saved and the dashboard will refresh.")
         st.rerun()
 
@@ -737,7 +1030,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
     col2.metric("Companies", results["company"].nunique())
     col3.metric("Sponsorship available", results["sponsorship_status"].map(is_sponsorship_available_status).sum())
     st.caption(
-        "New searches save jobs with relevance_score >= 2. Strong controls/contracts/PMO matches score highest; "
+        "New searches save jobs with relevance_score >= 1. Strong controls/contracts/PMO matches score highest; "
         "infrastructure management titles need sector context."
     )
 
@@ -788,6 +1081,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
         "apply_link": st.column_config.LinkColumn("Apply link"),
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
         "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
+        "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
         "description": st.column_config.TextColumn("Description", width="large"),
     }
 
@@ -815,11 +1109,95 @@ def render_dashboard(results: pd.DataFrame) -> None:
     )
 
     st.download_button(
-        "Export Results to Excel",
-        data=dataframe_to_excel_bytes(filtered),
+        "Export Full Results to Excel",
+        data=export_results_to_excel_bytes(filtered),
         file_name=f"job_search_results_{datetime.now().date().isoformat()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+def render_top_matches(results: pd.DataFrame) -> None:
+    st.subheader("Top Matches")
+    if results.empty:
+        st.info("No job results saved yet.")
+        return
+    top_matches = top_best_matches(results, limit=10)
+    st.caption("Sorted by relevance_score, cv_match_score, salary when available, and posted_at recency.")
+    st.dataframe(
+        top_matches.style.apply(highlight_sponsorship_available, axis=1),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "job_url": st.column_config.LinkColumn("Job URL"),
+            "apply_link": st.column_config.LinkColumn("Apply link"),
+            "description": st.column_config.TextColumn("Description", width="large"),
+        },
+    )
+
+
+def render_application_tracker(results: pd.DataFrame) -> None:
+    st.subheader("Application Tracker")
+    if results.empty:
+        st.info("No job results saved yet.")
+        return
+
+    tracker_columns = ["id", "company", "title", "location", "sponsorship_status", "relevance_score", "cv_match_score", "status", "notes", "apply_link"]
+    tracker_df = results[[column for column in tracker_columns if column in results.columns]].copy()
+    edited = st.data_editor(
+        tracker_df,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[column for column in tracker_df.columns if column not in {"status", "notes"}],
+        column_config={
+            "status": st.column_config.SelectboxColumn("Status", options=list(APPLICATION_STATUSES), required=True),
+            "notes": st.column_config.TextColumn("Notes", width="large"),
+            "apply_link": st.column_config.LinkColumn("Apply link"),
+        },
+    )
+    if st.button("Save Tracker Updates", type="primary"):
+        for row in edited.itertuples(index=False):
+            update_job_tracking(int(getattr(row, "id")), clean_text(getattr(row, "status")), clean_text(getattr(row, "notes")))
+        st.success("Tracker updates saved.")
+        st.rerun()
+
+
+def render_search_runs() -> None:
+    st.subheader("Saved Search Runs")
+    runs = get_search_runs()
+    if runs.empty:
+        st.info("No search runs saved yet.")
+    else:
+        st.dataframe(runs, use_container_width=True, hide_index=True)
+
+
+def render_settings(results: pd.DataFrame) -> None:
+    st.subheader("Settings")
+
+    st.markdown("### CV / Resume Matching")
+    cv_file = st.file_uploader("Upload CV / resume as PDF or DOCX", type=["pdf", "docx"])
+    if cv_file is not None and st.button("Extract CV Text"):
+        try:
+            cv_text = extract_cv_text(cv_file)
+            st.session_state["cv_text"] = cv_text
+            st.success(f"CV text extracted: {len(cv_text):,} characters.")
+        except Exception as exc:
+            st.error(f"Could not extract CV text: {exc}")
+    if st.session_state.get("cv_text"):
+        st.caption(f"Current CV text loaded: {len(st.session_state['cv_text']):,} characters.")
+
+    st.markdown("### Email Settings")
+    recipient_email = st.text_input("Recipient email", value=st.session_state.get("recipient_email", ""))
+    st.session_state["recipient_email"] = recipient_email
+    st.caption("Email is sent through SMTP credentials stored only in Streamlit secrets.")
+    if st.button("Send Top 10 Email Summary"):
+        if not recipient_email:
+            st.warning("Enter a recipient email first.")
+        else:
+            success, message = send_email_summary(recipient_email, top_best_matches(results, limit=10))
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
 
 
 def main() -> None:
@@ -832,20 +1210,35 @@ def main() -> None:
     targets = get_targets()
     results = get_results()
 
-    render_upload_section()
+    upload_tab, search_tab, dashboard_tab, top_matches_tab, tracker_tab, settings_tab = st.tabs(
+        ["Upload Targets", "Run Search", "Dashboard", "Top Matches", "Application Tracker", "Settings"]
+    )
 
-    st.divider()
-    st.subheader("Saved targets")
-    if targets.empty:
-        st.info("Upload an Excel file to add company/title pairs.")
-    else:
-        st.dataframe(targets, use_container_width=True, hide_index=True)
+    with upload_tab:
+        render_upload_section()
+        st.divider()
+        st.subheader("Saved targets")
+        if targets.empty:
+            st.info("Upload an Excel file to add company/title pairs.")
+        else:
+            st.dataframe(targets, use_container_width=True, hide_index=True)
 
-    st.divider()
-    render_search_section(targets)
+    with search_tab:
+        render_search_section(targets)
+        st.divider()
+        render_search_runs()
 
-    st.divider()
-    render_dashboard(results)
+    with dashboard_tab:
+        render_dashboard(results)
+
+    with top_matches_tab:
+        render_top_matches(results)
+
+    with tracker_tab:
+        render_application_tracker(results)
+
+    with settings_tab:
+        render_settings(results)
 
 
 if __name__ == "__main__":
