@@ -40,23 +40,37 @@ SPONSORSHIP_NOT_AVAILABLE_PATTERNS = (
     r"\bcannot\s+sponsor\b",
 )
 
-RELEVANT_TITLE_TERMS = (
-    "Contract",
-    "PMO",
-    "Project Controls",
-    "Program Controls",
-    "Risk",
-    "Planning",
-    "Scheduler",
+POSITIVE_RELEVANCE_TERMS = (
+    "contract",
+    "contracts",
+    "contract manager",
+    "contract management",
+    "pmo",
+    "project controls",
+    "program controls",
+    "risk manager",
+    "risk",
+    "scheduler",
+    "planning",
+    "schedule manager",
+    "project manager",
+    "construction manager",
 )
 
-EXCLUDED_TITLE_TERMS = (
-    "Engineer",
-    "Developer",
-    "Architect",
-    "IT",
-    "Software",
-    "Network",
+EXCLUDED_RELEVANCE_TERMS = (
+    "software",
+    "developer",
+    "architect",
+    "network",
+    "cloud",
+    "it",
+    "civil inspector",
+    "electrical inspector",
+    "technician",
+    "commissioning",
+    "field material controller",
+    "data center",
+    "airport inspector",
 )
 
 
@@ -100,12 +114,14 @@ def init_db() -> None:
                 apply_link TEXT,
                 sponsorship_status TEXT NOT NULL,
                 relevance_score INTEGER NOT NULL DEFAULT 0,
+                relevance_reason TEXT,
                 raw_json TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
         ensure_column(conn, "job_results", "relevance_score", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "job_results", "relevance_reason", "TEXT")
         ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
         ensure_column(conn, "job_results", "run_started_at", "TEXT")
 
@@ -173,6 +189,7 @@ def get_results() -> pd.DataFrame:
                 salary,
                 sponsorship_status,
                 relevance_score,
+                relevance_reason,
                 job_url,
                 apply_link,
                 description,
@@ -217,14 +234,21 @@ def contains_term(text: str, term: str) -> bool:
     return re.search(pattern, text.lower()) is not None
 
 
-def calculate_relevance_score(title: str) -> int:
-    title = clean_text(title)
+def score_job_relevance(title: str) -> tuple[int, str, bool]:
+    title = clean_text(title).lower()
     if not title:
-        return 0
-    if any(contains_term(title, term) for term in EXCLUDED_TITLE_TERMS):
-        return 0
-    matched_terms = [term for term in RELEVANT_TITLE_TERMS if contains_term(title, term)]
-    return len(matched_terms)
+        return 0, "No job title found.", False
+
+    excluded_terms = [term for term in EXCLUDED_RELEVANCE_TERMS if contains_term(title, term)]
+    if excluded_terms:
+        return 0, f"Excluded title term: {', '.join(excluded_terms)}.", True
+
+    matched_terms = [term for term in POSITIVE_RELEVANCE_TERMS if contains_term(title, term)]
+    if not matched_terms:
+        return 0, "No infrastructure, construction, PMO, contracts, controls, risk, scheduling, or planning title terms found.", False
+
+    score = len(matched_terms)
+    return score, f"Matched title terms: {', '.join(matched_terms)}.", False
 
 
 def best_apply_link(job: dict) -> str:
@@ -294,7 +318,10 @@ def save_job_results(
     with get_connection() as conn:
         for job in jobs:
             title = clean_text(job.get("title"))
-            relevance_score = calculate_relevance_score(title)
+            relevance_score, relevance_reason, is_excluded = score_job_relevance(title)
+            if is_excluded:
+                skipped += 1
+                continue
             if relevance_score < relevance_threshold:
                 skipped += 1
                 continue
@@ -326,10 +353,11 @@ def save_job_results(
                     apply_link,
                     sponsorship_status,
                     relevance_score,
+                    relevance_reason,
                     raw_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     make_result_key(company, searched_job_title, job),
@@ -349,6 +377,7 @@ def save_job_results(
                     apply_link,
                     sponsorship_status,
                     relevance_score,
+                    relevance_reason,
                     json.dumps(job),
                     created_at,
                 ),
@@ -420,10 +449,10 @@ def render_search_section(targets: pd.DataFrame) -> None:
     relevance_threshold = st.number_input(
         "Minimum relevance score to save",
         min_value=1,
-        max_value=len(RELEVANT_TITLE_TERMS),
+        max_value=len(POSITIVE_RELEVANCE_TERMS),
         value=1,
         step=1,
-        help="A job gets 1 point for each allowed term found in the job title. Excluded terms always score 0.",
+        help="A job gets 1 point for each positive title term. Excluded title terms are never saved.",
     )
 
     disabled = targets.empty or not api_key
@@ -500,10 +529,16 @@ def render_dashboard(results: pd.DataFrame) -> None:
         "Show only top 10 highest relevance jobs per run",
         value=False,
     )
+    high_relevance_only = st.checkbox(
+        "Show only jobs with relevance_score >= 2",
+        value=False,
+    )
 
     filtered = results[results["sponsorship_status"].isin(sponsorship_filter)]
     if company_filter:
         filtered = filtered[filtered["company"].isin(company_filter)]
+    if high_relevance_only:
+        filtered = filtered[filtered["relevance_score"] >= 2]
     if top_10_per_run:
         filtered = top_jobs_per_run(filtered, limit=10)
 
@@ -514,6 +549,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
         column_config={
             "job_url": st.column_config.LinkColumn("Job URL"),
             "apply_link": st.column_config.LinkColumn("Apply link"),
+            "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
             "description": st.column_config.TextColumn("Description", width="large"),
         },
     )

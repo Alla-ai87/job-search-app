@@ -8,6 +8,9 @@ This is a Streamlit Cloud app for searching U.S. jobs from an uploaded Excel lis
 - Save target company/title pairs in local SQLite storage.
 - Run Google Jobs searches through SerpAPI.
 - Save search results while skipping duplicates.
+- Filter results for relevant titles before saving.
+- Save a `relevance_score` and `relevance_reason` for each job.
+- Filter the dashboard to show only the top 10 highest relevance jobs per search run.
 - Detect sponsorship status as:
   - `sponsorship available`
   - `sponsorship not available`
@@ -58,3 +61,57 @@ On Streamlit Cloud, this storage is simple app-local storage. It is useful for l
 The SerpAPI key is read only from `st.secrets["SERPAPI_API_KEY"]`.
 
 The app never prints the API key, stores it in the database, or sends it to the browser.
+
+## Job Relevance Filtering
+
+The app lowercases each job title, then adds 1 point to `relevance_score` for every matching positive title term:
+
+- `contract`
+- `contracts`
+- `contract manager`
+- `contract management`
+- `pmo`
+- `project controls`
+- `program controls`
+- `risk manager`
+- `risk`
+- `scheduler`
+- `planning`
+- `schedule manager`
+- `project manager`
+- `construction manager`
+
+The app excludes jobs whose title contains any of these terms, so they are not saved to the results table:
+
+- `software`
+- `developer`
+- `architect`
+- `network`
+- `cloud`
+- `IT`
+- `civil inspector`
+- `electrical inspector`
+- `technician`
+- `commissioning`
+- `field material controller`
+- `data center`
+- `airport inspector`
+
+Jobs with `relevance_score` below 1 are not saved. Saved rows include `relevance_reason`, which explains the matched terms.
+
+The dashboard includes optional filters for `Show only top 10 highest relevance jobs per run` and `Show only jobs with relevance_score >= 2`. New searches are saved with a run ID so each run can be ranked separately.
+
+## Sponsorship Detection
+
+The app checks the job description for these sponsorship-related signals:
+
+- `visa sponsorship`
+- `work authorization`
+- `H1B`
+- `relocation support`
+
+If the description explicitly says `no sponsorship`, the job is marked `sponsorship not available`.
+
+If the description explicitly says `sponsorship provided`, the job is marked `sponsorship available`.
+
+Otherwise, the job is marked `not mentioned`.
