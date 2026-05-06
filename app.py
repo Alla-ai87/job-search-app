@@ -539,6 +539,12 @@ def matching_phrases(cv_text: str, job_text: str, phrases: tuple[str, ...]) -> l
     return [phrase for phrase in phrases if phrase in cv_normalized and phrase in job_normalized]
 
 
+def aliases_match(cv_text: str, job_text: str, aliases: tuple[str, ...]) -> bool:
+    cv_normalized = clean_text(cv_text).lower()
+    job_normalized = clean_text(job_text).lower()
+    return any(alias in cv_normalized for alias in aliases) and any(alias in job_normalized for alias in aliases)
+
+
 def calculate_cv_match(
     title: str,
     employer: str,
@@ -546,39 +552,45 @@ def calculate_cv_match(
     searched_job_title: str,
     cv_text: str,
 ) -> tuple[int, str]:
-    cv_tokens = tokenize_for_match(cv_text)
-    job_text = f"{title} {employer} {description} {searched_job_title}"
-    job_tokens = tokenize_for_match(job_text)
-    if not cv_tokens:
+    cv_text = clean_text(cv_text)
+    if not cv_text:
         return 0, "No CV uploaded."
-    if not job_tokens:
+
+    job_text = f"{title} {employer} {description} {searched_job_title}"
+    if not clean_text(job_text):
         return 0, "No job text available for CV comparison."
 
-    matched_tokens = sorted(job_tokens & cv_tokens)
-    coverage_score = min(35, round((len(matched_tokens) / max(1, len(job_tokens))) * 100))
+    score = 0
+    skill_matches = []
+    industry_matches = []
+    management_matches = []
 
-    matching_skills = matching_phrases(cv_text, job_text, CV_SKILL_TERMS)
-    matching_industries = matching_phrases(cv_text, job_text, CV_INDUSTRY_TERMS)
-    matching_management = matching_phrases(cv_text, job_text, CV_MANAGEMENT_TERMS)
+    weighted_rules = [
+        ("PMO", 15, ("pmo", "program management office"), skill_matches),
+        ("project controls", 15, ("project controls", "project control", "controls manager"), skill_matches),
+        ("contracts / contract management", 15, ("contracts", "contract management", "contract manager"), skill_matches),
+        ("risk management", 10, ("risk management", "risk manager", "risk"), skill_matches),
+        ("schedule / planning", 10, ("schedule", "scheduler", "scheduling", "planning"), skill_matches),
+        ("infrastructure / rail / metro / transit", 10, ("infrastructure", "rail", "metro", "transit"), industry_matches),
+        ("construction management", 10, ("construction management", "construction manager", "construction"), management_matches),
+        ("senior management / director / manager", 10, ("senior management", "director", "manager", "management", "leadership"), management_matches),
+    ]
 
-    score = coverage_score
-    score += min(35, len(matching_skills) * 10)
-    score += min(20, len(matching_industries) * 5)
-    score += min(20, len(matching_management) * 8)
+    for label, points, aliases, bucket in weighted_rules:
+        if aliases_match(cv_text, job_text, aliases):
+            score += points
+            bucket.append(label)
+
     score = min(100, score)
-
     reasons = []
-    if matching_skills:
-        reasons.append(f"Matching skills: {', '.join(matching_skills)}")
-    if matching_industries:
-        reasons.append(f"Matching industries: {', '.join(matching_industries)}")
-    if matching_management:
-        reasons.append(f"Matching management experience: {', '.join(matching_management)}")
-    if matched_tokens:
-        reasons.append(f"Keyword overlap: {', '.join(matched_tokens[:10])}")
-
+    if skill_matches:
+        reasons.append(f"Matching skills: {', '.join(skill_matches)}")
+    if industry_matches:
+        reasons.append(f"Matching industries: {', '.join(industry_matches)}")
+    if management_matches:
+        reasons.append(f"Matching management experience: {', '.join(management_matches)}")
     if not reasons:
-        return 0, "No meaningful overlap with CV keywords."
+        return 0, "No CV match against weighted PMO, controls, contracts, risk, schedule, infrastructure, or management criteria."
     return score, "; ".join(reasons)
 
 
@@ -701,12 +713,14 @@ def save_job_results(
     relevance_threshold: int,
     include_broader_infrastructure: bool,
     cv_text: str = "",
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     created_at = utc_now()
     inserted = 0
     skipped = 0
+    cv_positive_count = 0
     with get_connection() as conn:
         for job in jobs:
+            active_cv_text = clean_text(cv_text) or clean_text(st.session_state.get("cv_text", ""))
             title = clean_text(job.get("title"))
             description = clean_text(job.get("description"))
             relevance_score = calculate_relevance(title, description, include_broader_infrastructure)
@@ -730,8 +744,10 @@ def save_job_results(
                 employer_name,
                 description,
                 searched_job_title,
-                cv_text,
+                active_cv_text,
             )
+            if cv_match_score > 0:
+                cv_positive_count += 1
 
             cursor = conn.execute(
                 """
@@ -816,7 +832,7 @@ def save_job_results(
                 ),
             )
             inserted += cursor.rowcount
-    return inserted, skipped
+    return inserted, skipped, cv_positive_count
 
 
 def top_jobs_per_run(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
@@ -1130,6 +1146,10 @@ def render_search_section(targets: pd.DataFrame) -> None:
         counter_cols[1].metric("Duplicates skipped", counters["duplicates_skipped"])
         counter_cols[2].metric("Excluded by relevance", counters["excluded_by_relevance"])
         counter_cols[3].metric("Jobs saved", counters["jobs_saved"])
+        cv_counter_cols = st.columns(3)
+        cv_counter_cols[0].metric("CV text loaded", counters.get("cv_text_loaded", "no"))
+        cv_counter_cols[1].metric("CV text length", counters.get("cv_text_length", 0))
+        cv_counter_cols[2].metric("Jobs with CV match > 0", counters.get("jobs_with_cv_match", 0))
 
     if st.button("Run Job Search", type="primary", disabled=disabled):
         selected_targets = targets[
@@ -1144,6 +1164,8 @@ def render_search_section(targets: pd.DataFrame) -> None:
         total_raw_jobs = 0
         total_duplicates_skipped = 0
         total_excluded_by_relevance = 0
+        total_jobs_with_cv_match = 0
+        cv_text_for_run = clean_text(st.session_state.get("cv_text", ""))
 
         for index, row in enumerate(selected_targets.itertuples(index=False), start=1):
             status.write(f"Searching {row.job_title} at {row.company}...")
@@ -1154,7 +1176,7 @@ def render_search_section(targets: pd.DataFrame) -> None:
                     row.job_title,
                     int(max_jobs_per_target),
                 )
-                inserted, excluded_by_relevance = save_job_results(
+                inserted, excluded_by_relevance, jobs_with_cv_match = save_job_results(
                     run_id,
                     run_started_at,
                     row.company,
@@ -1162,12 +1184,13 @@ def render_search_section(targets: pd.DataFrame) -> None:
                     jobs,
                     SAVE_RELEVANCE_THRESHOLD,
                     include_broader_infrastructure,
-                    st.session_state.get("cv_text", ""),
+                    cv_text_for_run,
                 )
                 total_raw_jobs += raw_jobs_found
                 total_duplicates_skipped += duplicates_skipped
                 total_inserted += inserted
                 total_excluded_by_relevance += excluded_by_relevance
+                total_jobs_with_cv_match += jobs_with_cv_match
             except requests.HTTPError as exc:
                 st.error(f"SerpAPI error for {row.company} / {row.job_title}: {exc}")
             except requests.RequestException as exc:
@@ -1181,6 +1204,9 @@ def render_search_section(targets: pd.DataFrame) -> None:
             "duplicates_skipped": total_duplicates_skipped,
             "excluded_by_relevance": total_excluded_by_relevance,
             "jobs_saved": total_inserted,
+            "cv_text_loaded": "yes" if cv_text_for_run else "no",
+            "cv_text_length": len(cv_text_for_run),
+            "jobs_with_cv_match": total_jobs_with_cv_match,
         }
         save_search_run(
             run_id,
