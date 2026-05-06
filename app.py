@@ -340,6 +340,7 @@ def stable_job_id_from_row(row: pd.Series) -> str:
             clean_text(row.get("title")).lower(),
             clean_text(row.get("employer_name")).lower(),
             clean_text(row.get("location")).lower(),
+            clean_text(row.get("apply_link")).lower(),
         ]
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
@@ -357,6 +358,13 @@ def ensure_job_ids(df: pd.DataFrame) -> pd.DataFrame:
     if missing_id_mask.any():
         prepared.loc[missing_id_mask, "id"] = prepared[missing_id_mask].apply(stable_job_id_from_row, axis=1)
     return prepared
+
+
+def display_job_id_column(df: pd.DataFrame) -> pd.DataFrame:
+    prepared = ensure_job_ids(df)
+    if "id" not in prepared.columns:
+        return prepared
+    return prepared.rename(columns={"id": "Job ID"})
 
 
 def get_results() -> pd.DataFrame:
@@ -703,6 +711,21 @@ def aliases_match(cv_text: str, job_text: str, aliases: tuple[str, ...]) -> bool
     return any(alias in cv_normalized for alias in aliases) and any(alias in job_normalized for alias in aliases)
 
 
+def shared_terms(cv_text: str, job_text: str, terms: tuple[str, ...]) -> list[str]:
+    cv_normalized = clean_text(cv_text).lower()
+    job_normalized = clean_text(job_text).lower()
+    return [
+        term
+        for term in terms
+        if contains_term(cv_normalized, term) and contains_term(job_normalized, term)
+    ]
+
+
+def job_terms(job_text: str, terms: tuple[str, ...]) -> list[str]:
+    job_normalized = clean_text(job_text).lower()
+    return [term for term in terms if contains_term(job_normalized, term)]
+
+
 def calculate_cv_match(
     title: str,
     employer: str,
@@ -718,37 +741,78 @@ def calculate_cv_match(
     if not clean_text(job_text):
         return 0, "No job text available for CV comparison."
 
-    score = 0
-    skill_matches = []
-    industry_matches = []
-    management_matches = []
+    strong_terms = (
+        "project controls",
+        "program controls",
+        "pmo",
+        "contracts manager",
+        "contract manager",
+        "contract management",
+        "scheduling manager",
+        "planning manager",
+        "risk manager",
+    )
+    medium_terms = (
+        "project manager",
+        "construction manager",
+        "program manager",
+    )
+    infrastructure_terms = (
+        "rail",
+        "metro",
+        "transit",
+        "tunnel",
+        "infrastructure",
+        "transportation",
+        "aviation",
+        "airport",
+        "water",
+        "wastewater",
+        "highway",
+        "bridge",
+    )
+    seniority_terms = (
+        "senior",
+        "director",
+        "lead",
+        "manager",
+    )
+    penalty_terms = (
+        "regulatory specialist",
+        "compliance only",
+        "software",
+        "it",
+        "developer",
+        "architect",
+    )
 
-    weighted_rules = [
-        ("PMO", 15, ("pmo", "program management office"), skill_matches),
-        ("project controls", 15, ("project controls", "project control", "controls manager"), skill_matches),
-        ("contracts / contract management", 15, ("contracts", "contract management", "contract manager"), skill_matches),
-        ("risk management", 10, ("risk management", "risk manager", "risk"), skill_matches),
-        ("schedule / planning", 10, ("schedule", "scheduler", "scheduling", "planning"), skill_matches),
-        ("infrastructure / rail / metro / transit", 10, ("infrastructure", "rail", "metro", "transit"), industry_matches),
-        ("construction management", 10, ("construction management", "construction manager", "construction"), management_matches),
-        ("senior management / director / manager", 10, ("senior management", "director", "manager", "management", "leadership"), management_matches),
-    ]
+    strong_matches = shared_terms(cv_text, job_text, strong_terms)
+    medium_matches = shared_terms(cv_text, job_text, medium_terms)
+    industry_matches = shared_terms(cv_text, job_text, infrastructure_terms)
+    seniority_matches = shared_terms(cv_text, job_text, seniority_terms)
+    penalties = job_terms(job_text, penalty_terms)
 
-    for label, points, aliases, bucket in weighted_rules:
-        if aliases_match(cv_text, job_text, aliases):
-            score += points
-            bucket.append(label)
+    raw_score = 0
+    raw_score += 25 * len(strong_matches)
+    raw_score += 15 * len(medium_matches)
+    raw_score += 15 * len(industry_matches)
+    raw_score += 10 * len(seniority_matches)
+    raw_score -= 20 * len(penalties)
 
-    score = min(100, score)
+    score = max(0, min(100, raw_score))
     reasons = []
-    if skill_matches:
-        reasons.append(f"Matching skills: {', '.join(skill_matches)}")
+    if strong_matches:
+        reasons.append(f"Strong PMO/project controls/contracts keywords +25 each: {', '.join(strong_matches)}")
+    if medium_matches:
+        reasons.append(f"Management role keywords +15 each: {', '.join(medium_matches)}")
     if industry_matches:
-        reasons.append(f"Matching industries: {', '.join(industry_matches)}")
-    if management_matches:
-        reasons.append(f"Matching management experience: {', '.join(management_matches)}")
+        reasons.append(f"Infrastructure/transportation industry terms +15 each: {', '.join(industry_matches)}")
+    if seniority_matches:
+        reasons.append(f"Seniority keywords +10 each: {', '.join(seniority_matches)}")
+    if penalties:
+        reasons.append(f"Penalty -20 each for less relevant terms: {', '.join(penalties)}")
     if not reasons:
-        return 0, "No CV match against weighted PMO, controls, contracts, risk, schedule, infrastructure, or management criteria."
+        return 0, "No CV match against senior infrastructure PMO, project controls, contracts, scheduling, planning, risk, industry, or seniority criteria."
     return score, "; ".join(reasons)
 
 
@@ -1154,7 +1218,8 @@ def export_results_to_excel_bytes(df: pd.DataFrame) -> bytes:
     for column in EXPORT_COLUMNS:
         if column not in export_df.columns:
             export_df[column] = ""
-    export_df = export_df[EXPORT_COLUMNS].rename(columns={"id": "Job ID"})
+    export_columns = ["id"] + [column for column in EXPORT_COLUMNS if column != "id"]
+    export_df = export_df[export_columns].rename(columns={"id": "Job ID"})
     return dataframe_to_excel_bytes(export_df)
 
 
@@ -1270,6 +1335,7 @@ def highlight_applied_status(row: pd.Series) -> list[str]:
 def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = ensure_job_ids(df)
     preferred_front_cols = [
+        "id",
         "company",
         "searched_job_title",
         "title",
@@ -1286,7 +1352,7 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
         "application_notes",
         "apply_link",
     ]
-    end_cols = ["id", "run_id", "run_started_at"]
+    end_cols = ["run_id", "run_started_at"]
     front_cols = [column for column in preferred_front_cols if column in df.columns]
     middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
     existing_end_cols = [column for column in end_cols if column in df.columns]
@@ -1296,6 +1362,7 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
 def reorder_top_match_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = ensure_job_ids(df)
     preferred_front_cols = [
+        "id",
         "company",
         "searched_job_title",
         "title",
@@ -1312,7 +1379,7 @@ def reorder_top_match_columns(df: pd.DataFrame) -> pd.DataFrame:
         "application_notes",
         "apply_link",
     ]
-    end_cols = ["id", "run_id", "run_started_at"]
+    end_cols = ["run_id", "run_started_at"]
     front_cols = [column for column in preferred_front_cols if column in df.columns]
     middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
     existing_end_cols = [column for column in end_cols if column in df.columns]
@@ -1331,7 +1398,7 @@ def style_top_matches(df: pd.DataFrame):
 
 def top_matches_column_config() -> dict:
     return {
-        "id": st.column_config.TextColumn("Job ID"),
+        "Job ID": st.column_config.TextColumn("Job ID"),
         "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
         "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
         "job_url": st.column_config.LinkColumn("Job URL"),
@@ -1596,7 +1663,7 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         filtered = top_jobs_per_run(filtered, limit=20)
 
     table_column_config = {
-        "id": st.column_config.TextColumn("Job ID"),
+        "Job ID": st.column_config.TextColumn("Job ID"),
         "job_url": st.column_config.LinkColumn("Job URL"),
         "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
@@ -1614,7 +1681,7 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         st.info("No jobs match the current filters.")
     else:
         st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
-        top_matches = reorder_top_match_columns(top_matches)
+        top_matches = display_job_id_column(reorder_top_match_columns(top_matches))
         styled_top_matches = style_top_matches(top_matches)
         st.dataframe(
             styled_top_matches,
@@ -1624,9 +1691,9 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         )
 
     st.subheader("All matching jobs")
-    filtered = reorder_job_columns(filtered)
+    display_filtered = display_job_id_column(reorder_job_columns(filtered))
     styled_filtered = (
-        filtered.style.apply(highlight_sponsorship_available, axis=1)
+        display_filtered.style.apply(highlight_sponsorship_available, axis=1)
         .apply(highlight_cv_match_score, axis=1)
         .apply(highlight_applied_status, axis=1)
     )
@@ -1651,7 +1718,7 @@ def render_top_matches(results: pd.DataFrame) -> None:
         st.info("No job results saved yet.")
         return
     top_matches = top_best_matches(deduplicate_top_matches(results), limit=20)
-    top_matches = reorder_top_match_columns(top_matches)
+    top_matches = display_job_id_column(reorder_top_match_columns(top_matches))
     st.caption("Sorted by CV Match %, Relevance, salary when available, and posted_at recency.")
     st.dataframe(
         style_top_matches(top_matches),
@@ -1704,6 +1771,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         filtered_tracker = filtered_tracker[filtered_tracker["application_status"].isin(ACTIVE_APPLICATION_STATUSES)]
 
     tracker_columns = [
+        "id",
         "company",
         "title",
         "location",
@@ -1714,13 +1782,15 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         "applied_date",
         "application_notes",
         "apply_link",
-        "id",
+        "run_id",
+        "run_started_at",
     ]
     tracker_df = filtered_tracker[[column for column in tracker_columns if column in filtered_tracker.columns]].copy()
     if tracker_df.empty:
         st.info("No applications match the current tracker filters.")
         return
 
+    tracker_df = display_job_id_column(tracker_df)
     tracker_df.insert(0, "select", False)
     edited = st.data_editor(
         tracker_df,
@@ -1733,7 +1803,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         ],
         column_config={
             "select": st.column_config.CheckboxColumn("Select"),
-            "id": st.column_config.TextColumn("Job ID"),
+            "Job ID": st.column_config.TextColumn("Job ID"),
             "application_status": st.column_config.SelectboxColumn(
                 "Application status",
                 options=list(APPLICATION_STATUSES),
@@ -1747,7 +1817,8 @@ def render_application_tracker(results: pd.DataFrame) -> None:
 
     save_col, applied_col = st.columns([1, 1])
     if save_col.button("Save Tracker Updates", type="primary"):
-        for row in edited.itertuples(index=False):
+        edited_for_save = edited.rename(columns={"Job ID": "id"})
+        for row in edited_for_save.itertuples(index=False):
             update_job_tracking(
                 int(getattr(row, "id")),
                 clean_text(getattr(row, "application_status")),
@@ -1764,6 +1835,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
             return
 
         applied_timestamp = utc_now()
+        selected_rows = selected_rows.rename(columns={"Job ID": "id"})
         for row in selected_rows.itertuples(index=False):
             update_job_tracking(
                 int(getattr(row, "id")),
