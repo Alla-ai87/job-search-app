@@ -92,7 +92,8 @@ EXCLUDED_RELEVANCE_TERMS = (
 
 SAVE_RELEVANCE_THRESHOLD = 1
 
-APPLICATION_STATUSES = ("New", "Interested", "Applied", "Rejected", "Interview", "Archived")
+APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer", "Rejected", "Archived")
+ACTIVE_APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer")
 
 
 def get_connection() -> sqlite3.Connection:
@@ -141,6 +142,9 @@ def init_db() -> None:
                 cv_match_reason TEXT,
                 status TEXT NOT NULL DEFAULT 'New',
                 notes TEXT DEFAULT '',
+                application_status TEXT NOT NULL DEFAULT 'New',
+                applied_date TEXT,
+                application_notes TEXT DEFAULT '',
                 raw_json TEXT,
                 created_at TEXT NOT NULL
             )
@@ -153,8 +157,36 @@ def init_db() -> None:
         ensure_column(conn, "job_results", "cv_match_reason", "TEXT")
         ensure_column(conn, "job_results", "status", "TEXT NOT NULL DEFAULT 'New'")
         ensure_column(conn, "job_results", "notes", "TEXT DEFAULT ''")
+        ensure_column(conn, "job_results", "application_status", "TEXT NOT NULL DEFAULT 'New'")
+        ensure_column(conn, "job_results", "applied_date", "TEXT")
+        ensure_column(conn, "job_results", "application_notes", "TEXT DEFAULT ''")
         ensure_column(conn, "job_results", "run_id", "TEXT NOT NULL DEFAULT 'legacy'")
         ensure_column(conn, "job_results", "run_started_at", "TEXT")
+        conn.execute(
+            """
+            UPDATE job_results
+            SET application_status = COALESCE(NULLIF(status, ''), 'New')
+            WHERE application_status IS NULL OR application_status = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE job_results
+            SET application_status = status
+            WHERE
+                application_status = 'New'
+                AND status IS NOT NULL
+                AND status <> ''
+                AND status <> 'New'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE job_results
+            SET application_notes = COALESCE(notes, '')
+            WHERE application_notes IS NULL OR application_notes = ''
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS search_runs (
@@ -239,6 +271,9 @@ def get_results() -> pd.DataFrame:
                 cv_match_reason,
                 status,
                 notes,
+                application_status,
+                applied_date,
+                application_notes,
                 job_url,
                 apply_link,
                 description,
@@ -299,13 +334,22 @@ def save_search_run(
         )
 
 
-def update_job_tracking(job_id: int, status: str, notes: str) -> None:
-    if status not in APPLICATION_STATUSES:
-        status = "New"
+def update_job_tracking(job_id: int, application_status: str, application_notes: str, applied_date: str = "") -> None:
+    if application_status not in APPLICATION_STATUSES:
+        application_status = "New"
     with get_connection() as conn:
         conn.execute(
-            "UPDATE job_results SET status = ?, notes = ? WHERE id = ?",
-            (status, notes, job_id),
+            """
+            UPDATE job_results
+            SET
+                application_status = ?,
+                application_notes = ?,
+                applied_date = ?,
+                status = ?,
+                notes = ?
+            WHERE id = ?
+            """,
+            (application_status, application_notes, applied_date, application_status, application_notes, job_id),
         )
 
 
@@ -775,10 +819,13 @@ def save_job_results(
                     cv_match_reason,
                     status,
                     notes,
+                    application_status,
+                    applied_date,
+                    application_notes,
                     raw_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(result_key) DO UPDATE SET
                     run_id = excluded.run_id,
                     run_started_at = excluded.run_started_at,
@@ -826,6 +873,9 @@ def save_job_results(
                     cv_match_score,
                     cv_match_reason,
                     "New",
+                    "",
+                    "New",
+                    "",
                     "",
                     json.dumps(job),
                     created_at,
@@ -937,8 +987,9 @@ EXPORT_COLUMNS = [
     "relevance_reason",
     "cv_match_score",
     "cv_match_reason",
-    "status",
-    "notes",
+    "application_status",
+    "applied_date",
+    "application_notes",
     "apply_link",
 ]
 
@@ -1046,6 +1097,8 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
         "sponsorship_status",
         "relevance_score",
         "cv_match_score",
+        "application_status",
+        "applied_date",
         "apply_link",
     ]
     end_cols = ["id", "run_id", "run_started_at"]
@@ -1345,23 +1398,110 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         st.info("No job results saved yet.")
         return
 
-    tracker_columns = ["id", "company", "title", "location", "sponsorship_status", "relevance_score", "cv_match_score", "status", "notes", "apply_link"]
-    tracker_df = results[[column for column in tracker_columns if column in results.columns]].copy()
+    tracker_source = results.copy()
+    if "application_status" not in tracker_source.columns:
+        tracker_source["application_status"] = tracker_source.get("status", "New")
+    if "application_notes" not in tracker_source.columns:
+        tracker_source["application_notes"] = tracker_source.get("notes", "")
+    if "applied_date" not in tracker_source.columns:
+        tracker_source["applied_date"] = ""
+
+    tracker_source["application_status"] = tracker_source["application_status"].fillna("New").replace("", "New")
+    tracker_source["application_notes"] = tracker_source["application_notes"].fillna("")
+    tracker_source["applied_date"] = tracker_source["applied_date"].fillna("")
+
+    total_applied = int((tracker_source["application_status"] == "Applied").sum())
+    total_interviews = int((tracker_source["application_status"] == "Interview").sum())
+    total_offers = int((tracker_source["application_status"] == "Offer").sum())
+    stat_col1, stat_col2, stat_col3 = st.columns(3)
+    stat_col1.metric("Total Applied", total_applied)
+    stat_col2.metric("Interviews", total_interviews)
+    stat_col3.metric("Offers", total_offers)
+
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    show_applied = filter_col1.checkbox("Show only Applied", value=False)
+    show_interviews = filter_col2.checkbox("Show only Interviews", value=False)
+    show_active = filter_col3.checkbox("Show only Active jobs", value=False)
+
+    filtered_tracker = tracker_source
+    selected_statuses = []
+    if show_applied:
+        selected_statuses.append("Applied")
+    if show_interviews:
+        selected_statuses.append("Interview")
+    if selected_statuses:
+        filtered_tracker = filtered_tracker[filtered_tracker["application_status"].isin(selected_statuses)]
+    if show_active:
+        filtered_tracker = filtered_tracker[filtered_tracker["application_status"].isin(ACTIVE_APPLICATION_STATUSES)]
+
+    tracker_columns = [
+        "id",
+        "company",
+        "title",
+        "location",
+        "sponsorship_status",
+        "relevance_score",
+        "cv_match_score",
+        "application_status",
+        "applied_date",
+        "application_notes",
+        "apply_link",
+    ]
+    tracker_df = filtered_tracker[[column for column in tracker_columns if column in filtered_tracker.columns]].copy()
+    if tracker_df.empty:
+        st.info("No applications match the current tracker filters.")
+        return
+
+    tracker_df.insert(0, "select", False)
     edited = st.data_editor(
         tracker_df,
         use_container_width=True,
         hide_index=True,
-        disabled=[column for column in tracker_df.columns if column not in {"status", "notes"}],
+        disabled=[
+            column
+            for column in tracker_df.columns
+            if column not in {"select", "application_status", "applied_date", "application_notes"}
+        ],
         column_config={
-            "status": st.column_config.SelectboxColumn("Status", options=list(APPLICATION_STATUSES), required=True),
-            "notes": st.column_config.TextColumn("Notes", width="large"),
+            "select": st.column_config.CheckboxColumn("Select"),
+            "application_status": st.column_config.SelectboxColumn(
+                "Application status",
+                options=list(APPLICATION_STATUSES),
+                required=True,
+            ),
+            "applied_date": st.column_config.TextColumn("Applied date"),
+            "application_notes": st.column_config.TextColumn("Application notes", width="large"),
             "apply_link": st.column_config.LinkColumn("Apply link"),
         },
     )
-    if st.button("Save Tracker Updates", type="primary"):
+
+    save_col, applied_col = st.columns([1, 1])
+    if save_col.button("Save Tracker Updates", type="primary"):
         for row in edited.itertuples(index=False):
-            update_job_tracking(int(getattr(row, "id")), clean_text(getattr(row, "status")), clean_text(getattr(row, "notes")))
+            update_job_tracking(
+                int(getattr(row, "id")),
+                clean_text(getattr(row, "application_status")),
+                clean_text(getattr(row, "application_notes")),
+                clean_text(getattr(row, "applied_date")),
+            )
         st.success("Tracker updates saved.")
+        st.rerun()
+
+    if applied_col.button("Mark as Applied"):
+        selected_rows = edited[edited["select"] == True]
+        if selected_rows.empty:
+            st.warning("Select at least one job to mark as applied.")
+            return
+
+        applied_timestamp = utc_now()
+        for row in selected_rows.itertuples(index=False):
+            update_job_tracking(
+                int(getattr(row, "id")),
+                "Applied",
+                clean_text(getattr(row, "application_notes")),
+                applied_timestamp,
+            )
+        st.success(f"Marked {len(selected_rows)} job(s) as applied.")
         st.rerun()
 
 
