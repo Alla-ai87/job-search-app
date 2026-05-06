@@ -94,6 +94,8 @@ SAVE_RELEVANCE_THRESHOLD = 1
 
 APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer", "Rejected", "Archived")
 ACTIVE_APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer")
+COMPANY_HEADER_VALUES = {"company", "companies"}
+JOB_TITLE_HEADER_VALUES = {"job title", "job titles", "target job title", "target job titles"}
 
 
 def get_connection() -> sqlite3.Connection:
@@ -113,6 +115,46 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(company, job_title)
             )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS target_job_titles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_title TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO companies (company, created_at)
+            SELECT TRIM(company), MIN(created_at)
+            FROM targets
+            WHERE
+                TRIM(company) <> ''
+                AND LOWER(TRIM(company)) NOT IN ('company', 'companies')
+            GROUP BY TRIM(company)
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO target_job_titles (job_title, created_at)
+            SELECT TRIM(job_title), MIN(created_at)
+            FROM targets
+            WHERE
+                TRIM(job_title) <> ''
+                AND LOWER(TRIM(job_title)) NOT IN ('job title', 'job titles', 'target job title', 'target job titles')
+            GROUP BY TRIM(job_title)
             """
         )
         conn.execute(
@@ -213,37 +255,83 @@ def clean_text(value: object) -> str:
     return str(value).strip()
 
 
-def load_targets_from_excel(uploaded_file) -> pd.DataFrame:
+def normalize_lookup_value(value: object) -> str:
+    return clean_text(value).lower()
+
+
+def unique_non_header_values(series: pd.Series, header_values: set[str]) -> list[str]:
+    cleaned = series.map(clean_text)
+    cleaned = cleaned[cleaned != ""]
+    cleaned = cleaned[~cleaned.map(normalize_lookup_value).isin(header_values)]
+    return cleaned.drop_duplicates().tolist()
+
+
+def load_targets_from_excel(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.read_excel(uploaded_file, usecols=[0, 1], header=None, engine="openpyxl")
     df.columns = ["company", "job_title"]
-    df["company"] = df["company"].map(clean_text)
-    df["job_title"] = df["job_title"].map(clean_text)
-    df = df[(df["company"] != "") & (df["job_title"] != "")]
-    return df.drop_duplicates(subset=["company", "job_title"]).reset_index(drop=True)
+    companies = unique_non_header_values(df["company"], COMPANY_HEADER_VALUES)
+    job_titles = unique_non_header_values(df["job_title"], JOB_TITLE_HEADER_VALUES)
+    return pd.DataFrame({"company": companies}), pd.DataFrame({"job_title": job_titles})
 
 
-def save_targets(df: pd.DataFrame) -> int:
+def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame) -> tuple[int, int]:
     created_at = utc_now()
-    inserted = 0
+    inserted_companies = 0
+    inserted_job_titles = 0
     with get_connection() as conn:
-        for row in df.itertuples(index=False):
+        for row in companies_df.itertuples(index=False):
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO targets (company, job_title, created_at)
-                VALUES (?, ?, ?)
+                INSERT OR IGNORE INTO companies (company, created_at)
+                VALUES (?, ?)
                 """,
-                (row.company, row.job_title, created_at),
+                (row.company, created_at),
             )
-            inserted += cursor.rowcount
-    return inserted
+            inserted_companies += cursor.rowcount
+        for row in job_titles_df.itertuples(index=False):
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO target_job_titles (job_title, created_at)
+                VALUES (?, ?)
+                """,
+                (row.job_title, created_at),
+            )
+            inserted_job_titles += cursor.rowcount
+    return inserted_companies, inserted_job_titles
+
+
+def get_companies() -> pd.DataFrame:
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            "SELECT company, created_at FROM companies ORDER BY company",
+            conn,
+        )
+
+
+def get_target_job_titles() -> pd.DataFrame:
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            "SELECT job_title, created_at FROM target_job_titles ORDER BY job_title",
+            conn,
+        )
+
+
+def build_search_combinations(companies: pd.DataFrame, job_titles: pd.DataFrame) -> pd.DataFrame:
+    if companies.empty or job_titles.empty:
+        return pd.DataFrame(columns=["company", "job_title"])
+    company_values = companies["company"].map(clean_text)
+    job_title_values = job_titles["job_title"].map(clean_text)
+    company_values = company_values[(company_values != "") & (~company_values.map(normalize_lookup_value).isin(COMPANY_HEADER_VALUES))]
+    job_title_values = job_title_values[(job_title_values != "") & (~job_title_values.map(normalize_lookup_value).isin(JOB_TITLE_HEADER_VALUES))]
+    combinations = pd.MultiIndex.from_product(
+        [company_values.drop_duplicates(), job_title_values.drop_duplicates()],
+        names=["company", "job_title"],
+    ).to_frame(index=False)
+    return combinations.reset_index(drop=True)
 
 
 def get_targets() -> pd.DataFrame:
-    with get_connection() as conn:
-        return pd.read_sql_query(
-            "SELECT company, job_title, created_at FROM targets ORDER BY company, job_title",
-            conn,
-        )
+    return build_search_combinations(get_companies(), get_target_job_titles())
 
 
 def get_results() -> pd.DataFrame:
@@ -1238,39 +1326,48 @@ def render_upload_section() -> None:
         return
 
     try:
-        df = load_targets_from_excel(uploaded_file)
+        companies_df, job_titles_df = load_targets_from_excel(uploaded_file)
     except Exception as exc:
         st.error(f"Could not read Excel file: {exc}")
         return
 
-    if df.empty:
-        st.warning("No valid company/job title rows were found.")
+    if companies_df.empty or job_titles_df.empty:
+        st.warning("No valid companies or job titles were found.")
         return
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    preview_cols = st.columns(2)
+    with preview_cols[0]:
+        st.metric("Companies found", len(companies_df))
+        st.dataframe(companies_df, use_container_width=True, hide_index=True)
+    with preview_cols[1]:
+        st.metric("Job titles found", len(job_titles_df))
+        st.dataframe(job_titles_df, use_container_width=True, hide_index=True)
+    st.metric("Search combinations", len(companies_df) * len(job_titles_df))
+    if len(companies_df) <= 3:
+        st.warning("Please verify Column A contains the full company list.")
+
     if st.button("Save Uploaded Targets", type="primary"):
-        inserted = save_targets(df)
-        st.success(f"Saved {inserted} new target rows. Existing duplicates were skipped.")
+        inserted_companies, inserted_job_titles = save_targets(companies_df, job_titles_df)
+        st.success(
+            f"Saved {inserted_companies} new companies and {inserted_job_titles} new job titles. "
+            "Existing duplicates were skipped."
+        )
         st.rerun()
 
 
-def render_search_section(targets: pd.DataFrame) -> None:
+def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
     st.subheader("Run search")
     api_key = get_serpapi_key()
-    saved_target_count = len(targets) if targets is not None else 0
-    active_target_count = 0
-    if targets is not None and not targets.empty:
-        active_target_count = len(
-            targets[
-                (targets["company"].map(clean_text) != "")
-                & (targets["job_title"].map(clean_text) != "")
-            ]
-        )
+    targets = build_search_combinations(companies, job_titles)
+    company_count = len(companies) if companies is not None else 0
+    job_title_count = len(job_titles) if job_titles is not None else 0
+    saved_target_count = len(targets)
+    active_target_count = len(targets)
 
     disable_reasons = []
     if not api_key:
         disable_reasons.append("Missing SERPAPI_API_KEY in Streamlit secrets")
-    if saved_target_count == 0:
+    if company_count == 0 or job_title_count == 0:
         disable_reasons.append("Please upload targets first in Upload Targets tab")
     elif active_target_count == 0:
         disable_reasons.append("No active company/title pairs")
@@ -1280,14 +1377,15 @@ def render_search_section(targets: pd.DataFrame) -> None:
 
     if not api_key:
         st.warning("Missing SERPAPI_API_KEY in Streamlit secrets")
-    if saved_target_count == 0:
+    if company_count == 0 or job_title_count == 0:
         st.info("Please upload targets first in Upload Targets tab")
 
     st.markdown("### Debug")
-    debug_cols = st.columns(3)
-    debug_cols[0].metric("Saved targets", saved_target_count)
-    debug_cols[1].metric("SerpAPI key exists", "yes" if api_key else "no")
-    debug_cols[2].metric("Active company/title pairs", active_target_count)
+    debug_cols = st.columns(4)
+    debug_cols[0].metric("Total companies loaded", company_count)
+    debug_cols[1].metric("Total job titles loaded", job_title_count)
+    debug_cols[2].metric("Total search combinations", saved_target_count)
+    debug_cols[3].metric("SerpAPI key exists", "yes" if api_key else "no")
     st.caption(f"Reason button is disabled: {disabled_reason}")
 
     st.sidebar.header("Search settings")
@@ -1307,7 +1405,7 @@ def render_search_section(targets: pd.DataFrame) -> None:
         "Maximum company/title pairs to search this run",
         min_value=1,
         max_value=max(1, active_target_count),
-        value=min(10, max(1, active_target_count)),
+        value=max(1, active_target_count),
         step=1,
     )
     if "last_search_counters" in st.session_state:
@@ -1324,10 +1422,7 @@ def render_search_section(targets: pd.DataFrame) -> None:
         cv_counter_cols[2].metric("Jobs with CV match > 0", counters.get("jobs_with_cv_match", 0))
 
     if st.button("Run Job Search", type="primary", disabled=disabled):
-        selected_targets = targets[
-            (targets["company"].map(clean_text) != "")
-            & (targets["job_title"].map(clean_text) != "")
-        ].head(int(max_targets))
+        selected_targets = targets.head(int(max_targets))
         run_id = make_run_id()
         run_started_at = utc_now()
         progress = st.progress(0)
@@ -1392,8 +1487,16 @@ def render_search_section(targets: pd.DataFrame) -> None:
         st.rerun()
 
 
-def render_dashboard(results: pd.DataFrame) -> None:
+def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
     st.subheader("Dashboard")
+    total_companies = len(companies) if companies is not None else 0
+    total_job_titles = len(job_titles) if job_titles is not None else 0
+    total_search_combinations = total_companies * total_job_titles
+    target_cols = st.columns(3)
+    target_cols[0].metric("Total companies loaded", total_companies)
+    target_cols[1].metric("Total job titles loaded", total_job_titles)
+    target_cols[2].metric("Total search combinations", total_search_combinations)
+
     if results.empty:
         st.info("No job results saved yet.")
         return
@@ -1675,7 +1778,9 @@ def main() -> None:
     st.title("U.S. Job Search")
     st.caption("Upload target companies and roles, search Google Jobs through SerpAPI, and export deduplicated results.")
 
-    targets = get_targets()
+    companies = get_companies()
+    job_titles = get_target_job_titles()
+    targets = build_search_combinations(companies, job_titles)
     results = get_results()
 
     upload_tab, search_tab, dashboard_tab, top_matches_tab, tracker_tab, settings_tab = st.tabs(
@@ -1685,19 +1790,28 @@ def main() -> None:
     with upload_tab:
         render_upload_section()
         st.divider()
-        st.subheader("Saved targets")
-        if targets.empty:
-            st.info("Upload an Excel file to add company/title pairs.")
-        else:
-            st.dataframe(targets, use_container_width=True, hide_index=True)
+        saved_cols = st.columns(2)
+        with saved_cols[0]:
+            st.subheader("Saved Companies")
+            if companies.empty:
+                st.info("Upload an Excel file to add companies from Column A.")
+            else:
+                st.dataframe(companies, use_container_width=True, hide_index=True)
+        with saved_cols[1]:
+            st.subheader("Saved Job Titles")
+            if job_titles.empty:
+                st.info("Upload an Excel file to add job titles from Column B.")
+            else:
+                st.dataframe(job_titles, use_container_width=True, hide_index=True)
+        st.metric("Total search combinations", len(targets))
 
     with search_tab:
-        render_search_section(targets)
+        render_search_section(companies, job_titles)
         st.divider()
         render_search_runs()
 
     with dashboard_tab:
-        render_dashboard(results)
+        render_dashboard(results, companies, job_titles)
 
     with top_matches_tab:
         render_top_matches(results)
