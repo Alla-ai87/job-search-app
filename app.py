@@ -964,6 +964,46 @@ def top_best_matches(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
     return ranked.head(limit).drop(columns=["_salary_sort", "_recency_sort"], errors="ignore")
 
 
+def deduplicate_top_matches(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    required_columns = {"title", "employer_name", "location"}
+    if not required_columns.issubset(df.columns):
+        return df
+
+    deduped = df.copy()
+    deduped["_duplicate_title"] = deduped["title"].map(lambda value: clean_text(value).lower())
+    deduped["_duplicate_employer"] = deduped["employer_name"].map(lambda value: clean_text(value).lower())
+    deduped["_duplicate_location"] = deduped["location"].map(lambda value: clean_text(value).lower())
+    deduped["_dedupe_relevance_score"] = pd.to_numeric(deduped.get("relevance_score", 0), errors="coerce").fillna(0)
+    deduped["_dedupe_cv_match_score"] = pd.to_numeric(deduped.get("cv_match_score", 0), errors="coerce").fillna(0)
+    deduped["_dedupe_recency_score"] = deduped.apply(
+        lambda row: parse_recency_score(row.get("posted_at"), row.get("created_at")),
+        axis=1,
+    )
+    deduped = deduped.sort_values(
+        by=["_dedupe_relevance_score", "_dedupe_cv_match_score", "_dedupe_recency_score"],
+        ascending=[False, False, False],
+        na_position="last",
+    )
+    deduped = deduped.drop_duplicates(
+        subset=["_duplicate_title", "_duplicate_employer", "_duplicate_location"],
+        keep="first",
+    )
+    return deduped.drop(
+        columns=[
+            "_duplicate_title",
+            "_duplicate_employer",
+            "_duplicate_location",
+            "_dedupe_relevance_score",
+            "_dedupe_cv_match_score",
+            "_dedupe_recency_score",
+        ],
+        errors="ignore",
+    )
+
+
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     from io import BytesIO
 
@@ -1075,12 +1115,30 @@ def highlight_cv_match_score(row: pd.Series) -> list[str]:
     except (TypeError, ValueError):
         score = 0
     if score >= 80:
-        color = "background-color: #bbf7d0"
+        color = "background-color: #bbf7d0; color: #166534; font-weight: 700"
     elif score >= 60:
-        color = "background-color: #fed7aa"
+        color = "background-color: #fed7aa; color: #9a3412; font-weight: 700"
     else:
-        color = "background-color: #e5e7eb"
+        color = "background-color: #fecaca; color: #991b1b; font-weight: 700"
     styles[list(row.index).index("cv_match_score")] = color
+    return styles
+
+
+def highlight_relevance_score(row: pd.Series) -> list[str]:
+    styles = [""] * len(row)
+    if "relevance_score" not in row.index:
+        return styles
+    try:
+        score = int(row.get("relevance_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if score >= 3:
+        color = "background-color: #bbf7d0; color: #166534; font-weight: 700"
+    elif score == 2:
+        color = "background-color: #fef08a; color: #854d0e; font-weight: 700"
+    else:
+        color = "background-color: #e5e7eb; color: #374151; font-weight: 700"
+    styles[list(row.index).index("relevance_score")] = color
     return styles
 
 
@@ -1116,6 +1174,57 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
     middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
     existing_end_cols = [column for column in end_cols if column in df.columns]
     return df[front_cols + middle_cols + existing_end_cols]
+
+
+def reorder_top_match_columns(df: pd.DataFrame) -> pd.DataFrame:
+    preferred_front_cols = [
+        "company",
+        "searched_job_title",
+        "title",
+        "cv_match_score",
+        "relevance_score",
+        "employer_name",
+        "location",
+        "salary",
+        "posted_at",
+        "schedule_type",
+        "sponsorship_status",
+        "application_status",
+        "applied_date",
+        "application_notes",
+        "apply_link",
+    ]
+    end_cols = ["id", "run_id", "run_started_at"]
+    front_cols = [column for column in preferred_front_cols if column in df.columns]
+    middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
+    existing_end_cols = [column for column in end_cols if column in df.columns]
+    return df[front_cols + middle_cols + existing_end_cols]
+
+
+def style_top_matches(df: pd.DataFrame):
+    return (
+        df.style.apply(highlight_sponsorship_available, axis=1)
+        .apply(highlight_cv_match_score, axis=1)
+        .apply(highlight_relevance_score, axis=1)
+        .apply(highlight_applied_status, axis=1)
+        .format({"cv_match_score": "{:.0f}", "relevance_score": "{:.0f}"})
+    )
+
+
+def top_matches_column_config() -> dict:
+    return {
+        "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
+        "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
+        "job_url": st.column_config.LinkColumn("Job URL"),
+        "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
+        "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
+        "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
+        "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
+        "application_status": st.column_config.TextColumn("Application status"),
+        "applied_date": st.column_config.TextColumn("Applied date"),
+        "application_notes": st.column_config.TextColumn("Application notes", width="large"),
+        "description": st.column_config.TextColumn("Description", width="large"),
+    }
 
 
 def render_upload_section() -> None:
@@ -1354,7 +1463,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
 
     table_column_config = {
         "job_url": st.column_config.LinkColumn("Job URL"),
-        "apply_link": st.column_config.LinkColumn("Apply link"),
+        "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
         "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
         "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
@@ -1365,22 +1474,18 @@ def render_dashboard(results: pd.DataFrame) -> None:
     }
 
     st.subheader("Top 10 best matches")
-    top_matches = top_best_matches(filtered, limit=10)
+    top_matches = top_best_matches(deduplicate_top_matches(filtered), limit=10)
     if top_matches.empty:
         st.info("No jobs match the current filters.")
     else:
         st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
-        top_matches = reorder_job_columns(top_matches)
-        styled_top_matches = (
-            top_matches.style.apply(highlight_sponsorship_available, axis=1)
-            .apply(highlight_cv_match_score, axis=1)
-            .apply(highlight_applied_status, axis=1)
-        )
+        top_matches = reorder_top_match_columns(top_matches)
+        styled_top_matches = style_top_matches(top_matches)
         st.dataframe(
             styled_top_matches,
             use_container_width=True,
             hide_index=True,
-            column_config=table_column_config,
+            column_config=top_matches_column_config(),
         )
 
     st.subheader("All matching jobs")
@@ -1410,23 +1515,14 @@ def render_top_matches(results: pd.DataFrame) -> None:
     if results.empty:
         st.info("No job results saved yet.")
         return
-    top_matches = top_best_matches(results, limit=10)
-    top_matches = reorder_job_columns(top_matches)
-    st.caption("Sorted by cv_match_score, relevance_score, salary when available, and posted_at recency.")
+    top_matches = top_best_matches(deduplicate_top_matches(results), limit=10)
+    top_matches = reorder_top_match_columns(top_matches)
+    st.caption("Sorted by CV Match %, Relevance, salary when available, and posted_at recency.")
     st.dataframe(
-        top_matches.style.apply(highlight_sponsorship_available, axis=1)
-        .apply(highlight_cv_match_score, axis=1)
-        .apply(highlight_applied_status, axis=1),
+        style_top_matches(top_matches),
         use_container_width=True,
         hide_index=True,
-        column_config={
-            "job_url": st.column_config.LinkColumn("Job URL"),
-            "apply_link": st.column_config.LinkColumn("Apply link"),
-            "application_status": st.column_config.TextColumn("Application status"),
-            "applied_date": st.column_config.TextColumn("Applied date"),
-            "application_notes": st.column_config.TextColumn("Application notes", width="large"),
-            "description": st.column_config.TextColumn("Description", width="large"),
-        },
+        column_config=top_matches_column_config(),
     )
 
 
@@ -1509,7 +1605,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
             ),
             "applied_date": st.column_config.TextColumn("Applied date"),
             "application_notes": st.column_config.TextColumn("Application notes", width="large"),
-            "apply_link": st.column_config.LinkColumn("Apply link"),
+            "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
         },
     )
 
