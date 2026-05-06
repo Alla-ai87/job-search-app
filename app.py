@@ -744,13 +744,17 @@ def calculate_cv_match(
     strong_terms = (
         "project controls",
         "program controls",
+        "controls manager",
         "pmo",
+        "project controls professional",
         "contracts manager",
         "contract manager",
         "contract management",
         "scheduling manager",
         "planning manager",
+        "scheduler",
         "risk manager",
+        "risk management",
     )
     medium_terms = (
         "project manager",
@@ -773,13 +777,17 @@ def calculate_cv_match(
     )
     seniority_terms = (
         "senior",
-        "director",
         "lead",
+        "director",
         "manager",
     )
     penalty_terms = (
+        "regulatory",
         "regulatory specialist",
+        "compliance",
         "compliance only",
+        "utilities",
+        "utility",
         "software",
         "it",
         "developer",
@@ -793,24 +801,24 @@ def calculate_cv_match(
     penalties = job_terms(job_text, penalty_terms)
 
     raw_score = 0
-    raw_score += 25 * len(strong_matches)
-    raw_score += 15 * len(medium_matches)
+    raw_score += 40 * len(strong_matches)
+    raw_score += 10 * len(medium_matches)
     raw_score += 15 * len(industry_matches)
-    raw_score += 10 * len(seniority_matches)
-    raw_score -= 20 * len(penalties)
+    raw_score += 8 * len(seniority_matches)
+    raw_score -= 30 * len(penalties)
 
     score = max(0, min(100, raw_score))
     reasons = []
     if strong_matches:
-        reasons.append(f"Strong PMO/project controls/contracts keywords +25 each: {', '.join(strong_matches)}")
+        reasons.append(f"Strong project controls / PMO / contracts / planning / risk keywords +40 each: {', '.join(strong_matches)}")
     if medium_matches:
-        reasons.append(f"Management role keywords +15 each: {', '.join(medium_matches)}")
+        reasons.append(f"Generic management role keywords +10 each: {', '.join(medium_matches)}")
     if industry_matches:
         reasons.append(f"Infrastructure/transportation industry terms +15 each: {', '.join(industry_matches)}")
     if seniority_matches:
-        reasons.append(f"Seniority keywords +10 each: {', '.join(seniority_matches)}")
+        reasons.append(f"Seniority keywords +8 each: {', '.join(seniority_matches)}")
     if penalties:
-        reasons.append(f"Penalty -20 each for less relevant terms: {', '.join(penalties)}")
+        reasons.append(f"Penalty -30 each for regulatory/compliance/utilities/technical terms: {', '.join(penalties)}")
     if not reasons:
         return 0, "No CV match against senior infrastructure PMO, project controls, contracts, scheduling, planning, risk, industry, or seniority criteria."
     return score, "; ".join(reasons)
@@ -1191,34 +1199,45 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-EXPORT_COLUMNS = [
+BASE_EXPORT_COLUMNS = [
+    "id",
     "company",
-    "searched_job_title",
     "title",
     "employer_name",
     "location",
     "salary",
     "posted_at",
+    "schedule_type",
     "sponsorship_status",
-    "sponsorship_reason",
-    "relevance_score",
-    "relevance_reason",
     "cv_match_score",
+    "relevance_score",
+    "apply_link",
+    "sponsorship_reason",
+    "relevance_reason",
     "cv_match_reason",
     "application_status",
     "applied_date",
     "application_notes",
-    "apply_link",
-    "id",
 ]
+SEARCH_METADATA_EXPORT_COLUMNS = ["searched_job_title"]
+TECHNICAL_EXPORT_COLUMNS = ["run_id", "run_started_at"]
 
 
-def export_results_to_excel_bytes(df: pd.DataFrame) -> bytes:
+def export_results_to_excel_bytes(
+    df: pd.DataFrame,
+    include_search_metadata: bool = False,
+    include_technical_details: bool = False,
+) -> bytes:
     export_df = ensure_job_ids(df)
-    for column in EXPORT_COLUMNS:
+    export_columns = BASE_EXPORT_COLUMNS.copy()
+    if include_search_metadata:
+        export_columns.insert(2, "searched_job_title")
+    if include_technical_details:
+        export_columns.extend(TECHNICAL_EXPORT_COLUMNS)
+
+    for column in export_columns:
         if column not in export_df.columns:
             export_df[column] = ""
-    export_columns = ["id"] + [column for column in EXPORT_COLUMNS if column != "id"]
     export_df = export_df[export_columns].rename(columns={"id": "Job ID"})
     return dataframe_to_excel_bytes(export_df)
 
@@ -1332,12 +1351,11 @@ def highlight_applied_status(row: pd.Series) -> list[str]:
     return styles
 
 
-def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
+def reorder_job_columns(df: pd.DataFrame, show_technical_details: bool = False) -> pd.DataFrame:
     df = ensure_job_ids(df)
     preferred_front_cols = [
         "id",
         "company",
-        "searched_job_title",
         "title",
         "employer_name",
         "location",
@@ -1345,43 +1363,44 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
         "posted_at",
         "schedule_type",
         "sponsorship_status",
-        "relevance_score",
         "cv_match_score",
-        "application_status",
-        "applied_date",
-        "application_notes",
+        "relevance_score",
         "apply_link",
+        "application_status",
+        "application_notes",
+        "applied_date",
     ]
-    end_cols = ["run_id", "run_started_at"]
+    hidden_cols = ["searched_job_title", "run_id", "run_started_at"]
+    end_cols = ["run_id", "run_started_at"] if show_technical_details else []
     front_cols = [column for column in preferred_front_cols if column in df.columns]
-    middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
+    middle_cols = [column for column in df.columns if column not in front_cols and column not in hidden_cols]
     existing_end_cols = [column for column in end_cols if column in df.columns]
     return df[front_cols + middle_cols + existing_end_cols]
 
 
-def reorder_top_match_columns(df: pd.DataFrame) -> pd.DataFrame:
+def reorder_top_match_columns(df: pd.DataFrame, show_technical_details: bool = False) -> pd.DataFrame:
     df = ensure_job_ids(df)
     preferred_front_cols = [
         "id",
         "company",
-        "searched_job_title",
         "title",
-        "cv_match_score",
-        "relevance_score",
         "employer_name",
         "location",
         "salary",
         "posted_at",
         "schedule_type",
         "sponsorship_status",
-        "application_status",
-        "applied_date",
-        "application_notes",
+        "cv_match_score",
+        "relevance_score",
         "apply_link",
+        "application_status",
+        "application_notes",
+        "applied_date",
     ]
-    end_cols = ["run_id", "run_started_at"]
+    hidden_cols = ["searched_job_title", "run_id", "run_started_at"]
+    end_cols = ["run_id", "run_started_at"] if show_technical_details else []
     front_cols = [column for column in preferred_front_cols if column in df.columns]
-    middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
+    middle_cols = [column for column in df.columns if column not in front_cols and column not in hidden_cols]
     existing_end_cols = [column for column in end_cols if column in df.columns]
     return df[front_cols + middle_cols + existing_end_cols]
 
@@ -1403,12 +1422,14 @@ def top_matches_column_config() -> dict:
         "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
         "job_url": st.column_config.LinkColumn("Job URL"),
         "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
+        "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
+        "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
         "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
         "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
-        "application_status": st.column_config.TextColumn("Application status"),
+        "application_status": st.column_config.TextColumn("status"),
         "applied_date": st.column_config.TextColumn("Applied date"),
-        "application_notes": st.column_config.TextColumn("Application notes", width="large"),
+        "application_notes": st.column_config.TextColumn("notes", width="large"),
         "description": st.column_config.TextColumn("Description", width="large"),
     }
 
@@ -1641,6 +1662,10 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         "Show only top 20 highest relevance jobs per run",
         value=False,
     )
+    show_technical_details = st.checkbox(
+        "Show technical details",
+        value=False,
+    )
     minimum_relevance_score = st.slider(
         "Minimum relevance score",
         min_value=1,
@@ -1669,9 +1694,9 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
         "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
         "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
-        "application_status": st.column_config.TextColumn("Application status"),
+        "application_status": st.column_config.TextColumn("status"),
         "applied_date": st.column_config.TextColumn("Applied date"),
-        "application_notes": st.column_config.TextColumn("Application notes", width="large"),
+        "application_notes": st.column_config.TextColumn("notes", width="large"),
         "description": st.column_config.TextColumn("Description", width="large"),
     }
 
@@ -1681,17 +1706,17 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         st.info("No jobs match the current filters.")
     else:
         st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
-        top_matches = display_job_id_column(reorder_top_match_columns(top_matches))
+        top_matches = display_job_id_column(reorder_top_match_columns(top_matches, show_technical_details))
         styled_top_matches = style_top_matches(top_matches)
         st.dataframe(
             styled_top_matches,
             use_container_width=True,
             hide_index=True,
             column_config=top_matches_column_config(),
-        )
+    )
 
     st.subheader("All matching jobs")
-    display_filtered = display_job_id_column(reorder_job_columns(filtered))
+    display_filtered = display_job_id_column(reorder_job_columns(filtered, show_technical_details))
     styled_filtered = (
         display_filtered.style.apply(highlight_sponsorship_available, axis=1)
         .apply(highlight_cv_match_score, axis=1)
@@ -1704,9 +1729,17 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         column_config=table_column_config,
     )
 
+    include_search_metadata = st.checkbox(
+        "Include search metadata",
+        value=False,
+    )
     st.download_button(
         "Export Full Results to Excel",
-        data=export_results_to_excel_bytes(filtered),
+        data=export_results_to_excel_bytes(
+            filtered,
+            include_search_metadata=include_search_metadata,
+            include_technical_details=show_technical_details,
+        ),
         file_name=f"job_search_results_{datetime.now().date().isoformat()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
@@ -1717,8 +1750,9 @@ def render_top_matches(results: pd.DataFrame) -> None:
     if results.empty:
         st.info("No job results saved yet.")
         return
+    show_technical_details = st.checkbox("Show technical details", value=False, key="top_matches_show_technical_details")
     top_matches = top_best_matches(deduplicate_top_matches(results), limit=20)
-    top_matches = display_job_id_column(reorder_top_match_columns(top_matches))
+    top_matches = display_job_id_column(reorder_top_match_columns(top_matches, show_technical_details))
     st.caption("Sorted by CV Match %, Relevance, salary when available, and posted_at recency.")
     st.dataframe(
         style_top_matches(top_matches),
@@ -1758,6 +1792,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
     show_applied = filter_col1.checkbox("Show only Applied", value=False)
     show_interviews = filter_col2.checkbox("Show only Interviews", value=False)
     show_active = filter_col3.checkbox("Show only Active jobs", value=False)
+    show_technical_details = st.checkbox("Show technical details", value=False, key="tracker_show_technical_details")
 
     filtered_tracker = tracker_source
     selected_statuses = []
@@ -1774,17 +1809,21 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         "id",
         "company",
         "title",
+        "employer_name",
         "location",
+        "salary",
+        "posted_at",
+        "schedule_type",
         "sponsorship_status",
-        "relevance_score",
         "cv_match_score",
+        "relevance_score",
+        "apply_link",
         "application_status",
         "applied_date",
         "application_notes",
-        "apply_link",
-        "run_id",
-        "run_started_at",
     ]
+    if show_technical_details:
+        tracker_columns.extend(["run_id", "run_started_at"])
     tracker_df = filtered_tracker[[column for column in tracker_columns if column in filtered_tracker.columns]].copy()
     if tracker_df.empty:
         st.info("No applications match the current tracker filters.")
@@ -1804,13 +1843,15 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         column_config={
             "select": st.column_config.CheckboxColumn("Select"),
             "Job ID": st.column_config.TextColumn("Job ID"),
+            "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
+            "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
             "application_status": st.column_config.SelectboxColumn(
-                "Application status",
+                "status",
                 options=list(APPLICATION_STATUSES),
                 required=True,
             ),
             "applied_date": st.column_config.TextColumn("Applied date"),
-            "application_notes": st.column_config.TextColumn("Application notes", width="large"),
+            "application_notes": st.column_config.TextColumn("notes", width="large"),
             "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
         },
     )
