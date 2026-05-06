@@ -334,9 +334,34 @@ def get_targets() -> pd.DataFrame:
     return build_search_combinations(get_companies(), get_target_job_titles())
 
 
+def stable_job_id_from_row(row: pd.Series) -> str:
+    identity = "|".join(
+        [
+            clean_text(row.get("title")).lower(),
+            clean_text(row.get("employer_name")).lower(),
+            clean_text(row.get("location")).lower(),
+        ]
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def ensure_job_ids(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    prepared = df.copy()
+    if "id" not in prepared.columns:
+        prepared["id"] = prepared.apply(stable_job_id_from_row, axis=1)
+        return prepared
+
+    missing_id_mask = prepared["id"].map(clean_text) == ""
+    if missing_id_mask.any():
+        prepared.loc[missing_id_mask, "id"] = prepared[missing_id_mask].apply(stable_job_id_from_row, axis=1)
+    return prepared
+
+
 def get_results() -> pd.DataFrame:
     with get_connection() as conn:
-        return pd.read_sql_query(
+        results = pd.read_sql_query(
             """
             SELECT
                 id,
@@ -371,6 +396,7 @@ def get_results() -> pd.DataFrame:
             """,
             conn,
         )
+    return ensure_job_ids(results)
 
 
 def get_search_runs() -> pd.DataFrame:
@@ -1119,22 +1145,24 @@ EXPORT_COLUMNS = [
     "applied_date",
     "application_notes",
     "apply_link",
+    "id",
 ]
 
 
 def export_results_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    export_df = df.copy()
+    export_df = ensure_job_ids(df)
     for column in EXPORT_COLUMNS:
         if column not in export_df.columns:
             export_df[column] = ""
-    return dataframe_to_excel_bytes(export_df[EXPORT_COLUMNS])
+    export_df = export_df[EXPORT_COLUMNS].rename(columns={"id": "Job ID"})
+    return dataframe_to_excel_bytes(export_df)
 
 
 def build_email_body(top_matches: pd.DataFrame) -> str:
     if top_matches.empty:
         return "No matching jobs are currently saved."
 
-    lines = ["Top 10 best job matches", ""]
+    lines = ["Top 20 best job matches", ""]
     for index, row in enumerate(top_matches.itertuples(index=False), start=1):
         lines.extend(
             [
@@ -1165,7 +1193,7 @@ def send_email_summary(recipient_email: str, top_matches: pd.DataFrame) -> tuple
     message = MIMEMultipart()
     message["From"] = smtp_sender
     message["To"] = recipient_email
-    message["Subject"] = "Daily Job Search Top 10 Summary"
+    message["Subject"] = "Daily Job Search Top 20 Summary"
     message.attach(MIMEText(build_email_body(top_matches), "plain"))
 
     try:
@@ -1240,6 +1268,7 @@ def highlight_applied_status(row: pd.Series) -> list[str]:
 
 
 def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = ensure_job_ids(df)
     preferred_front_cols = [
         "company",
         "searched_job_title",
@@ -1265,6 +1294,7 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def reorder_top_match_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = ensure_job_ids(df)
     preferred_front_cols = [
         "company",
         "searched_job_title",
@@ -1301,6 +1331,7 @@ def style_top_matches(df: pd.DataFrame):
 
 def top_matches_column_config() -> dict:
     return {
+        "id": st.column_config.TextColumn("Job ID"),
         "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
         "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
         "job_url": st.column_config.LinkColumn("Job URL"),
@@ -1539,8 +1570,8 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         "Show only jobs I applied to",
         value=False,
     )
-    top_10_per_run = st.checkbox(
-        "Show only top 10 highest relevance jobs per run",
+    top_20_per_run = st.checkbox(
+        "Show only top 20 highest relevance jobs per run",
         value=False,
     )
     minimum_relevance_score = st.slider(
@@ -1561,10 +1592,11 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
     elif application_status_filter != "All statuses":
         filtered = filtered[filtered["application_status"] == application_status_filter]
     filtered = filtered[filtered["relevance_score"] >= minimum_relevance_score]
-    if top_10_per_run:
-        filtered = top_jobs_per_run(filtered, limit=10)
+    if top_20_per_run:
+        filtered = top_jobs_per_run(filtered, limit=20)
 
     table_column_config = {
+        "id": st.column_config.TextColumn("Job ID"),
         "job_url": st.column_config.LinkColumn("Job URL"),
         "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
@@ -1576,8 +1608,8 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         "description": st.column_config.TextColumn("Description", width="large"),
     }
 
-    st.subheader("Top 10 best matches")
-    top_matches = top_best_matches(deduplicate_top_matches(filtered), limit=10)
+    st.subheader("Top 20 best matches")
+    top_matches = top_best_matches(deduplicate_top_matches(filtered), limit=20)
     if top_matches.empty:
         st.info("No jobs match the current filters.")
     else:
@@ -1618,7 +1650,7 @@ def render_top_matches(results: pd.DataFrame) -> None:
     if results.empty:
         st.info("No job results saved yet.")
         return
-    top_matches = top_best_matches(deduplicate_top_matches(results), limit=10)
+    top_matches = top_best_matches(deduplicate_top_matches(results), limit=20)
     top_matches = reorder_top_match_columns(top_matches)
     st.caption("Sorted by CV Match %, Relevance, salary when available, and posted_at recency.")
     st.dataframe(
@@ -1635,7 +1667,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         st.info("No job results saved yet.")
         return
 
-    tracker_source = results.copy()
+    tracker_source = ensure_job_ids(results)
     if "application_status" not in tracker_source.columns:
         tracker_source["application_status"] = tracker_source.get("status", "New")
     if "application_notes" not in tracker_source.columns:
@@ -1672,7 +1704,6 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         filtered_tracker = filtered_tracker[filtered_tracker["application_status"].isin(ACTIVE_APPLICATION_STATUSES)]
 
     tracker_columns = [
-        "id",
         "company",
         "title",
         "location",
@@ -1683,6 +1714,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         "applied_date",
         "application_notes",
         "apply_link",
+        "id",
     ]
     tracker_df = filtered_tracker[[column for column in tracker_columns if column in filtered_tracker.columns]].copy()
     if tracker_df.empty:
@@ -1701,6 +1733,7 @@ def render_application_tracker(results: pd.DataFrame) -> None:
         ],
         column_config={
             "select": st.column_config.CheckboxColumn("Select"),
+            "id": st.column_config.TextColumn("Job ID"),
             "application_status": st.column_config.SelectboxColumn(
                 "Application status",
                 options=list(APPLICATION_STATUSES),
