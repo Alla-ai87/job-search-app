@@ -1017,6 +1017,28 @@ def highlight_cv_match_score(row: pd.Series) -> list[str]:
     return styles
 
 
+def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
+    preferred_front_cols = [
+        "company",
+        "searched_job_title",
+        "title",
+        "employer_name",
+        "location",
+        "salary",
+        "posted_at",
+        "schedule_type",
+        "sponsorship_status",
+        "relevance_score",
+        "cv_match_score",
+        "apply_link",
+    ]
+    end_cols = ["id", "run_id", "run_started_at"]
+    front_cols = [column for column in preferred_front_cols if column in df.columns]
+    middle_cols = [column for column in df.columns if column not in front_cols and column not in end_cols]
+    existing_end_cols = [column for column in end_cols if column in df.columns]
+    return df[front_cols + middle_cols + existing_end_cols]
+
+
 def render_upload_section() -> None:
     st.subheader("Upload targets")
     uploaded_file = st.file_uploader(
@@ -1244,6 +1266,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
         st.info("No jobs match the current filters.")
     else:
         st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
+        top_matches = reorder_job_columns(top_matches)
         styled_top_matches = top_matches.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1)
         st.dataframe(
             styled_top_matches,
@@ -1253,6 +1276,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
         )
 
     st.subheader("All matching jobs")
+    filtered = reorder_job_columns(filtered)
     styled_filtered = filtered.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1)
     st.dataframe(
         styled_filtered,
@@ -1275,6 +1299,7 @@ def render_top_matches(results: pd.DataFrame) -> None:
         st.info("No job results saved yet.")
         return
     top_matches = top_best_matches(results, limit=10)
+    top_matches = reorder_job_columns(top_matches)
     st.caption("Sorted by cv_match_score, relevance_score, salary when available, and posted_at recency.")
     st.dataframe(
         top_matches.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1),
