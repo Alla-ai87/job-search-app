@@ -444,6 +444,41 @@ CV_STOPWORDS = {
     "at",
 }
 
+CV_SKILL_TERMS = (
+    "pmo",
+    "project controls",
+    "contracts",
+    "schedule",
+    "scheduler",
+    "risk management",
+    "risk",
+)
+
+CV_INDUSTRY_TERMS = (
+    "rail",
+    "infrastructure",
+    "metro",
+    "transit",
+    "construction",
+    "water",
+    "wastewater",
+    "aviation",
+    "airport",
+    "highway",
+    "bridge",
+    "tunnel",
+    "design-build",
+)
+
+CV_MANAGEMENT_TERMS = (
+    "construction management",
+    "project management",
+    "program management",
+    "contract management",
+    "controls management",
+    "stakeholder management",
+)
+
 
 def tokenize_for_match(text: str) -> set[str]:
     tokens = set(re.findall(r"[a-zA-Z][a-zA-Z0-9+-]{2,}", clean_text(text).lower()))
@@ -498,21 +533,53 @@ def extract_cv_text(uploaded_file) -> str:
     return ""
 
 
-def calculate_cv_match(title: str, description: str, cv_text: str) -> tuple[int, str]:
+def matching_phrases(cv_text: str, job_text: str, phrases: tuple[str, ...]) -> list[str]:
+    cv_normalized = clean_text(cv_text).lower()
+    job_normalized = clean_text(job_text).lower()
+    return [phrase for phrase in phrases if phrase in cv_normalized and phrase in job_normalized]
+
+
+def calculate_cv_match(
+    title: str,
+    employer: str,
+    description: str,
+    searched_job_title: str,
+    cv_text: str,
+) -> tuple[int, str]:
     cv_tokens = tokenize_for_match(cv_text)
-    job_tokens = tokenize_for_match(f"{title} {description}")
+    job_text = f"{title} {employer} {description} {searched_job_title}"
+    job_tokens = tokenize_for_match(job_text)
     if not cv_tokens:
         return 0, "No CV uploaded."
     if not job_tokens:
         return 0, "No job text available for CV comparison."
 
     matched_tokens = sorted(job_tokens & cv_tokens)
-    coverage = len(matched_tokens) / max(1, len(job_tokens))
-    score = min(100, round(coverage * 100))
-    if not matched_tokens:
+    coverage_score = min(35, round((len(matched_tokens) / max(1, len(job_tokens))) * 100))
+
+    matching_skills = matching_phrases(cv_text, job_text, CV_SKILL_TERMS)
+    matching_industries = matching_phrases(cv_text, job_text, CV_INDUSTRY_TERMS)
+    matching_management = matching_phrases(cv_text, job_text, CV_MANAGEMENT_TERMS)
+
+    score = coverage_score
+    score += min(35, len(matching_skills) * 10)
+    score += min(20, len(matching_industries) * 5)
+    score += min(20, len(matching_management) * 8)
+    score = min(100, score)
+
+    reasons = []
+    if matching_skills:
+        reasons.append(f"Matching skills: {', '.join(matching_skills)}")
+    if matching_industries:
+        reasons.append(f"Matching industries: {', '.join(matching_industries)}")
+    if matching_management:
+        reasons.append(f"Matching management experience: {', '.join(matching_management)}")
+    if matched_tokens:
+        reasons.append(f"Keyword overlap: {', '.join(matched_tokens[:10])}")
+
+    if not reasons:
         return 0, "No meaningful overlap with CV keywords."
-    preview = ", ".join(matched_tokens[:12])
-    return score, f"Matched CV keywords: {preview}"
+    return score, "; ".join(reasons)
 
 
 def best_apply_link(job: dict) -> str:
@@ -658,7 +725,13 @@ def save_job_results(
             job_url = normalize_job_url(job)
             application_text = collect_application_text(job)
             sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
-            cv_match_score, cv_match_reason = calculate_cv_match(title, description, cv_text)
+            cv_match_score, cv_match_reason = calculate_cv_match(
+                title,
+                employer_name,
+                description,
+                searched_job_title,
+                cv_text,
+            )
 
             cursor = conn.execute(
                 """
@@ -818,7 +891,7 @@ def top_best_matches(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
         axis=1,
     )
     ranked = ranked.sort_values(
-        by=["relevance_score", "cv_match_score", "_salary_sort", "_recency_sort"],
+        by=["cv_match_score", "relevance_score", "_salary_sort", "_recency_sort"],
         ascending=[False, False, False, False],
         na_position="last",
     )
@@ -926,6 +999,24 @@ def highlight_sponsorship_available(row: pd.Series) -> list[str]:
     return [""] * len(row)
 
 
+def highlight_cv_match_score(row: pd.Series) -> list[str]:
+    styles = [""] * len(row)
+    if "cv_match_score" not in row.index:
+        return styles
+    try:
+        score = int(row.get("cv_match_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if score >= 80:
+        color = "background-color: #bbf7d0"
+    elif score >= 60:
+        color = "background-color: #fed7aa"
+    else:
+        color = "background-color: #e5e7eb"
+    styles[list(row.index).index("cv_match_score")] = color
+    return styles
+
+
 def render_upload_section() -> None:
     st.subheader("Upload targets")
     uploaded_file = st.file_uploader(
@@ -956,8 +1047,38 @@ def render_upload_section() -> None:
 def render_search_section(targets: pd.DataFrame) -> None:
     st.subheader("Run search")
     api_key = get_serpapi_key()
+    saved_target_count = len(targets) if targets is not None else 0
+    active_target_count = 0
+    if targets is not None and not targets.empty:
+        active_target_count = len(
+            targets[
+                (targets["company"].map(clean_text) != "")
+                & (targets["job_title"].map(clean_text) != "")
+            ]
+        )
+
+    disable_reasons = []
     if not api_key:
-        st.warning("Add SERPAPI_API_KEY to Streamlit secrets before running searches.")
+        disable_reasons.append("Missing SERPAPI_API_KEY in Streamlit secrets")
+    if saved_target_count == 0:
+        disable_reasons.append("Please upload targets first in Upload Targets tab")
+    elif active_target_count == 0:
+        disable_reasons.append("No active company/title pairs")
+
+    disabled_reason = "; ".join(disable_reasons) if disable_reasons else "Button enabled"
+    disabled = bool(disable_reasons)
+
+    if not api_key:
+        st.warning("Missing SERPAPI_API_KEY in Streamlit secrets")
+    if saved_target_count == 0:
+        st.info("Please upload targets first in Upload Targets tab")
+
+    st.markdown("### Debug")
+    debug_cols = st.columns(3)
+    debug_cols[0].metric("Saved targets", saved_target_count)
+    debug_cols[1].metric("SerpAPI key exists", "yes" if api_key else "no")
+    debug_cols[2].metric("Active company/title pairs", active_target_count)
+    st.caption(f"Reason button is disabled: {disabled_reason}")
 
     st.sidebar.header("Search settings")
     max_jobs_per_target = st.sidebar.slider(
@@ -975,11 +1096,10 @@ def render_search_section(targets: pd.DataFrame) -> None:
     max_targets = st.number_input(
         "Maximum company/title pairs to search this run",
         min_value=1,
-        max_value=max(1, len(targets)),
-        value=min(10, max(1, len(targets))),
+        max_value=max(1, active_target_count),
+        value=min(10, max(1, active_target_count)),
         step=1,
     )
-    disabled = targets.empty or not api_key
     if "last_search_counters" in st.session_state:
         counters = st.session_state["last_search_counters"]
         st.caption(f"Last search run: {counters['run_id']}")
@@ -990,7 +1110,10 @@ def render_search_section(targets: pd.DataFrame) -> None:
         counter_cols[3].metric("Jobs saved", counters["jobs_saved"])
 
     if st.button("Run Job Search", type="primary", disabled=disabled):
-        selected_targets = targets.head(int(max_targets))
+        selected_targets = targets[
+            (targets["company"].map(clean_text) != "")
+            & (targets["job_title"].map(clean_text) != "")
+        ].head(int(max_targets))
         run_id = make_run_id()
         run_started_at = utc_now()
         progress = st.progress(0)
@@ -1120,8 +1243,8 @@ def render_dashboard(results: pd.DataFrame) -> None:
     if top_matches.empty:
         st.info("No jobs match the current filters.")
     else:
-        st.caption("Sorted by relevance score, salary when available, then posting recency.")
-        styled_top_matches = top_matches.style.apply(highlight_sponsorship_available, axis=1)
+        st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
+        styled_top_matches = top_matches.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1)
         st.dataframe(
             styled_top_matches,
             use_container_width=True,
@@ -1130,7 +1253,7 @@ def render_dashboard(results: pd.DataFrame) -> None:
         )
 
     st.subheader("All matching jobs")
-    styled_filtered = filtered.style.apply(highlight_sponsorship_available, axis=1)
+    styled_filtered = filtered.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1)
     st.dataframe(
         styled_filtered,
         use_container_width=True,
@@ -1152,9 +1275,9 @@ def render_top_matches(results: pd.DataFrame) -> None:
         st.info("No job results saved yet.")
         return
     top_matches = top_best_matches(results, limit=10)
-    st.caption("Sorted by relevance_score, cv_match_score, salary when available, and posted_at recency.")
+    st.caption("Sorted by cv_match_score, relevance_score, salary when available, and posted_at recency.")
     st.dataframe(
-        top_matches.style.apply(highlight_sponsorship_available, axis=1),
+        top_matches.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1),
         use_container_width=True,
         hide_index=True,
         column_config={
