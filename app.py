@@ -1084,6 +1084,15 @@ def highlight_cv_match_score(row: pd.Series) -> list[str]:
     return styles
 
 
+def highlight_applied_status(row: pd.Series) -> list[str]:
+    styles = [""] * len(row)
+    if clean_text(row.get("application_status")) != "Applied":
+        return styles
+    if "application_status" in row.index:
+        styles[list(row.index).index("application_status")] = "background-color: #bbf7d0; font-weight: 700"
+    return styles
+
+
 def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
     preferred_front_cols = [
         "company",
@@ -1099,6 +1108,7 @@ def reorder_job_columns(df: pd.DataFrame) -> pd.DataFrame:
         "cv_match_score",
         "application_status",
         "applied_date",
+        "application_notes",
         "apply_link",
     ]
     end_cols = ["id", "run_id", "run_started_at"]
@@ -1309,6 +1319,14 @@ def render_dashboard(results: pd.DataFrame) -> None:
         "Company",
         options=sorted(results["company"].dropna().unique()),
     )
+    application_status_filter = st.selectbox(
+        "Application status",
+        options=["All statuses", *APPLICATION_STATUSES],
+    )
+    show_applied_only = st.checkbox(
+        "Show only jobs I applied to",
+        value=False,
+    )
     top_10_per_run = st.checkbox(
         "Show only top 10 highest relevance jobs per run",
         value=False,
@@ -1326,6 +1344,10 @@ def render_dashboard(results: pd.DataFrame) -> None:
         filtered = filtered[filtered["sponsorship_status"].map(is_sponsorship_available_status)]
     if company_filter:
         filtered = filtered[filtered["company"].isin(company_filter)]
+    if show_applied_only:
+        filtered = filtered[filtered["application_status"] == "Applied"]
+    elif application_status_filter != "All statuses":
+        filtered = filtered[filtered["application_status"] == application_status_filter]
     filtered = filtered[filtered["relevance_score"] >= minimum_relevance_score]
     if top_10_per_run:
         filtered = top_jobs_per_run(filtered, limit=10)
@@ -1336,6 +1358,9 @@ def render_dashboard(results: pd.DataFrame) -> None:
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
         "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
         "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
+        "application_status": st.column_config.TextColumn("Application status"),
+        "applied_date": st.column_config.TextColumn("Applied date"),
+        "application_notes": st.column_config.TextColumn("Application notes", width="large"),
         "description": st.column_config.TextColumn("Description", width="large"),
     }
 
@@ -1346,7 +1371,11 @@ def render_dashboard(results: pd.DataFrame) -> None:
     else:
         st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
         top_matches = reorder_job_columns(top_matches)
-        styled_top_matches = top_matches.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1)
+        styled_top_matches = (
+            top_matches.style.apply(highlight_sponsorship_available, axis=1)
+            .apply(highlight_cv_match_score, axis=1)
+            .apply(highlight_applied_status, axis=1)
+        )
         st.dataframe(
             styled_top_matches,
             use_container_width=True,
@@ -1356,7 +1385,11 @@ def render_dashboard(results: pd.DataFrame) -> None:
 
     st.subheader("All matching jobs")
     filtered = reorder_job_columns(filtered)
-    styled_filtered = filtered.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1)
+    styled_filtered = (
+        filtered.style.apply(highlight_sponsorship_available, axis=1)
+        .apply(highlight_cv_match_score, axis=1)
+        .apply(highlight_applied_status, axis=1)
+    )
     st.dataframe(
         styled_filtered,
         use_container_width=True,
@@ -1381,12 +1414,17 @@ def render_top_matches(results: pd.DataFrame) -> None:
     top_matches = reorder_job_columns(top_matches)
     st.caption("Sorted by cv_match_score, relevance_score, salary when available, and posted_at recency.")
     st.dataframe(
-        top_matches.style.apply(highlight_sponsorship_available, axis=1).apply(highlight_cv_match_score, axis=1),
+        top_matches.style.apply(highlight_sponsorship_available, axis=1)
+        .apply(highlight_cv_match_score, axis=1)
+        .apply(highlight_applied_status, axis=1),
         use_container_width=True,
         hide_index=True,
         column_config={
             "job_url": st.column_config.LinkColumn("Job URL"),
             "apply_link": st.column_config.LinkColumn("Apply link"),
+            "application_status": st.column_config.TextColumn("Application status"),
+            "applied_date": st.column_config.TextColumn("Applied date"),
+            "application_notes": st.column_config.TextColumn("Application notes", width="large"),
             "description": st.column_config.TextColumn("Description", width="large"),
         },
     )
