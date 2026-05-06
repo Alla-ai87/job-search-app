@@ -450,16 +450,46 @@ def tokenize_for_match(text: str) -> set[str]:
     return {token for token in tokens if token not in CV_STOPWORDS}
 
 
+def extract_pdf_text(file) -> str:
+    from pypdf import PdfReader
+
+    text = ""
+    reader = PdfReader(file)
+    for page in reader.pages:
+        try:
+            text += page.extract_text() or ""
+        except Exception:
+            continue
+    return text
+
+
+def extract_with_pdfplumber(file) -> str:
+    import pdfplumber
+
+    text = ""
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
+    return text
+
+
 def extract_cv_text(uploaded_file) -> str:
     if uploaded_file is None:
         return ""
     suffix = Path(uploaded_file.name).suffix.lower()
     data = uploaded_file.getvalue()
     if suffix == ".pdf":
-        from pypdf import PdfReader
-
-        reader = PdfReader(BytesIO(data))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        text = ""
+        try:
+            text = extract_pdf_text(BytesIO(data))
+        except Exception:
+            text = ""
+        if len(text.strip()) < 50:
+            try:
+                text = extract_with_pdfplumber(BytesIO(data))
+            except Exception:
+                text = ""
+        return text
     if suffix == ".docx":
         from docx import Document
 
@@ -1178,6 +1208,10 @@ def render_settings(results: pd.DataFrame) -> None:
     if cv_file is not None and st.button("Extract CV Text"):
         try:
             cv_text = extract_cv_text(cv_file)
+            st.info(f"Extracted text length: {len(cv_text):,} characters")
+            if len(cv_text.strip()) < 50:
+                st.warning("This PDF may be scanned. Please upload DOCX instead.")
+                return
             st.session_state["cv_text"] = cv_text
             st.success(f"CV text extracted: {len(cv_text):,} characters.")
         except Exception:
