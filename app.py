@@ -128,6 +128,21 @@ RESULT_COLUMNS = [
     "created_at",
 ]
 
+REQUIRED_SUPABASE_TABLES = (
+    "companies",
+    "target_job_titles",
+    "job_results",
+    "search_runs",
+    "application_tracker",
+    "notes",
+    "saved_profiles",
+)
+
+SUPABASE_SECRETS_EXAMPLE = """SERPAPI_API_KEY = "your_serpapi_key_here"
+SUPABASE_URL = "https://your-project-ref.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "your_supabase_service_role_key_here"
+"""
+
 
 def get_supabase_credentials() -> tuple[str, str]:
     try:
@@ -138,13 +153,17 @@ def get_supabase_credentials() -> tuple[str, str]:
     return url, key
 
 
-def is_supabase_enabled() -> bool:
+def is_supabase_configured() -> bool:
     url, key = get_supabase_credentials()
     return bool(url and key)
 
 
 def storage_mode_label() -> str:
-    return "Supabase" if is_supabase_enabled() else "temporary local SQLite"
+    return "Supabase" if is_supabase_connected() else "temporary local SQLite"
+
+
+def is_supabase_connected() -> bool:
+    return bool(st.session_state.get("supabase_connected", False))
 
 
 def supabase_headers(prefer: str = "") -> dict[str, str]:
@@ -184,6 +203,66 @@ def supabase_request(
     if not response.content:
         return []
     return response.json()
+
+
+def check_supabase_table(table_name: str) -> tuple[bool, str]:
+    try:
+        supabase_request("GET", table_name, params={"select": "*", "limit": 1})
+    except requests.HTTPError as exc:
+        return False, str(exc)
+    except requests.RequestException as exc:
+        return False, str(exc)
+    return True, ""
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_supabase_setup_status(url: str, key: str) -> dict:
+    if not url or not key:
+        missing = []
+        if not url:
+            missing.append("SUPABASE_URL")
+        if not key:
+            missing.append("SUPABASE_SERVICE_ROLE_KEY")
+        return {"connected": False, "missing_secrets": missing, "missing_tables": [], "errors": {}}
+
+    missing_tables = []
+    errors = {}
+    for table_name in REQUIRED_SUPABASE_TABLES:
+        ok, error = check_supabase_table(table_name)
+        if not ok:
+            missing_tables.append(table_name)
+            errors[table_name] = error
+    return {
+        "connected": not missing_tables,
+        "missing_secrets": [],
+        "missing_tables": missing_tables,
+        "errors": errors,
+    }
+
+
+def render_supabase_setup_instructions(status: dict) -> None:
+    missing_secrets = status.get("missing_secrets") or []
+    missing_tables = status.get("missing_tables") or []
+    if missing_secrets:
+        st.error("Running in temporary local mode. Missing Supabase secrets: " + ", ".join(missing_secrets))
+    elif missing_tables:
+        st.error("Running in temporary local mode. Supabase is configured, but required tables are missing or inaccessible.")
+        st.caption("Missing/inaccessible tables: " + ", ".join(missing_tables))
+    else:
+        st.warning("Running in temporary local mode.")
+
+    st.markdown("#### Connect Supabase in Streamlit Cloud")
+    st.markdown(
+        """
+1. Create a Supabase project.
+2. Open Supabase **SQL Editor**.
+3. Run the full `supabase_schema.sql` file from this repository.
+4. In Streamlit Cloud, open the app settings and go to **Secrets**.
+5. Add the secrets below, then reboot the app.
+        """
+    )
+    st.code(SUPABASE_SECRETS_EXAMPLE, language="toml")
+    st.info("Historical runs remain permanent only after the app shows `Connected to Supabase`.")
 
 
 def supabase_upsert(table_name: str, rows: list[dict], conflict_column: str) -> object:
@@ -361,9 +440,29 @@ def init_db() -> None:
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS search_profiles (
+            CREATE TABLE IF NOT EXISTS saved_profiles (
                 profile_name TEXT PRIMARY KEY,
                 settings_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS application_tracker (
+                job_id TEXT PRIMARY KEY,
+                application_status TEXT NOT NULL DEFAULT 'New',
+                applied_date TEXT,
+                application_notes TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notes (
+                job_id TEXT PRIMARY KEY,
+                note_text TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
             )
             """
@@ -371,7 +470,7 @@ def init_db() -> None:
 
 
 def init_storage() -> None:
-    if not is_supabase_enabled():
+    if not is_supabase_connected():
         init_db()
 
 
@@ -408,7 +507,7 @@ def load_targets_from_excel(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame) -> tuple[int, int]:
     created_at = utc_now()
-    if is_supabase_enabled():
+    if is_supabase_connected():
         company_rows = [
             {"company": clean_text(row.company), "created_at": created_at}
             for row in companies_df.itertuples(index=False)
@@ -448,7 +547,7 @@ def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame) -> tup
 
 
 def get_companies() -> pd.DataFrame:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         rows = supabase_request(
             "GET",
             "companies",
@@ -464,7 +563,7 @@ def get_companies() -> pd.DataFrame:
 
 
 def get_target_job_titles() -> pd.DataFrame:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         rows = supabase_request(
             "GET",
             "target_job_titles",
@@ -531,7 +630,7 @@ def display_job_id_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_results() -> pd.DataFrame:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         rows = supabase_request(
             "GET",
             "job_results",
@@ -586,7 +685,7 @@ def get_results() -> pd.DataFrame:
 
 
 def get_search_runs() -> pd.DataFrame:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         rows = supabase_request(
             "GET",
             "search_runs",
@@ -632,7 +731,7 @@ def save_search_run(
     excluded_by_relevance: int,
     jobs_saved: int,
 ) -> None:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         supabase_upsert(
             "search_runs",
             [
@@ -675,7 +774,8 @@ def save_search_run(
 def update_job_tracking(job_id: int, application_status: str, application_notes: str, applied_date: str = "") -> None:
     if application_status not in APPLICATION_STATUSES:
         application_status = "New"
-    if is_supabase_enabled():
+    if is_supabase_connected():
+        updated_at = utc_now()
         supabase_request(
             "PATCH",
             "job_results",
@@ -688,6 +788,32 @@ def update_job_tracking(job_id: int, application_status: str, application_notes:
                 "notes": application_notes,
             },
             prefer="return=minimal",
+        )
+        supabase_upsert(
+            "application_tracker",
+            [
+                {
+                    "job_id": str(job_id),
+                    "job_result_id": job_id,
+                    "application_status": application_status,
+                    "application_notes": application_notes,
+                    "applied_date": applied_date or None,
+                    "updated_at": updated_at,
+                }
+            ],
+            "job_id",
+        )
+        supabase_upsert(
+            "notes",
+            [
+                {
+                    "job_id": str(job_id),
+                    "job_result_id": job_id,
+                    "note_text": application_notes,
+                    "updated_at": updated_at,
+                }
+            ],
+            "job_id",
         )
         return
 
@@ -709,7 +835,7 @@ def update_job_tracking(job_id: int, application_status: str, application_notes:
 
 def save_cv_profile(cv_text: str, cv_summary: str = "") -> None:
     updated_at = utc_now()
-    if is_supabase_enabled():
+    if is_supabase_connected():
         supabase_upsert(
             "cv_profiles",
             [
@@ -739,7 +865,7 @@ def save_cv_profile(cv_text: str, cv_summary: str = "") -> None:
 
 
 def get_cv_profile() -> tuple[str, str]:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         rows = supabase_request(
             "GET",
             "cv_profiles",
@@ -762,9 +888,9 @@ def get_cv_profile() -> tuple[str, str]:
 def save_search_profile(profile_name: str, settings: dict[str, int]) -> None:
     updated_at = utc_now()
     payload = json.dumps(settings)
-    if is_supabase_enabled():
+    if is_supabase_connected():
         supabase_upsert(
-            "search_profiles",
+            "saved_profiles",
             [
                 {
                     "profile_name": profile_name,
@@ -779,7 +905,7 @@ def save_search_profile(profile_name: str, settings: dict[str, int]) -> None:
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO search_profiles (profile_name, settings_json, updated_at)
+            INSERT INTO saved_profiles (profile_name, settings_json, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(profile_name) DO UPDATE SET
                 settings_json = excluded.settings_json,
@@ -790,10 +916,10 @@ def save_search_profile(profile_name: str, settings: dict[str, int]) -> None:
 
 
 def get_search_profile(profile_name: str) -> dict[str, int]:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         rows = supabase_request(
             "GET",
-            "search_profiles",
+            "saved_profiles",
             params={"select": "settings_json", "profile_name": f"eq.{profile_name}", "limit": 1},
         )
         if not rows:
@@ -803,7 +929,7 @@ def get_search_profile(profile_name: str) -> dict[str, int]:
 
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT settings_json FROM search_profiles WHERE profile_name = ?",
+            "SELECT settings_json FROM saved_profiles WHERE profile_name = ?",
             (profile_name,),
         ).fetchone()
     if not row:
@@ -1412,7 +1538,7 @@ def save_job_results(
     include_broader_infrastructure: bool,
     cv_text: str = "",
 ) -> tuple[int, int, int]:
-    if is_supabase_enabled():
+    if is_supabase_connected():
         return save_job_results_supabase(
             run_id,
             run_started_at,
@@ -1947,7 +2073,7 @@ def render_upload_section() -> None:
 
     if st.button("Save Uploaded Targets", type="primary"):
         inserted_companies, inserted_job_titles = save_targets(companies_df, job_titles_df)
-        if is_supabase_enabled():
+        if is_supabase_connected():
             st.success(
                 f"Saved/updated {inserted_companies} companies and {inserted_job_titles} job titles in Supabase. "
                 "Existing duplicates were kept as one saved value."
@@ -2585,7 +2711,7 @@ def latest_run_id(search_runs: pd.DataFrame, results: pd.DataFrame) -> str:
 
 def render_history_overview(results: pd.DataFrame, search_runs: pd.DataFrame) -> pd.DataFrame:
     st.markdown("### Last saved search run")
-    if not is_supabase_enabled():
+    if not is_supabase_connected():
         st.warning("Temporary local storage may reset.")
 
     if results.empty and search_runs.empty:
@@ -2647,11 +2773,18 @@ def render_history_overview(results: pd.DataFrame, search_runs: pd.DataFrame) ->
 
 def main() -> None:
     st.set_page_config(page_title="U.S. Job Search", layout="wide")
+    supabase_url, supabase_key = get_supabase_credentials()
+    supabase_status = get_supabase_setup_status(supabase_url, supabase_key)
+    st.session_state["supabase_connected"] = bool(supabase_status.get("connected"))
     init_storage()
 
     st.title("U.S. Job Search")
     st.caption("Upload target companies and roles, search Google Jobs through SerpAPI, and export deduplicated results.")
-    st.info(f"Storage mode: {storage_mode_label()}")
+    if is_supabase_connected():
+        st.success("Connected to Supabase")
+    else:
+        st.warning("Running in temporary local mode")
+        render_supabase_setup_instructions(supabase_status)
 
     if "cv_text" not in st.session_state or not clean_text(st.session_state.get("cv_text")):
         saved_cv_text, _ = get_cv_profile()

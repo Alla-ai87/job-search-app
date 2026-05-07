@@ -58,7 +58,23 @@ create table if not exists cv_profiles (
     updated_at timestamptz not null default now()
 );
 
-create table if not exists search_profiles (
+create table if not exists application_tracker (
+    job_id text primary key,
+    job_result_id bigint references job_results(id) on delete cascade,
+    application_status text not null default 'New',
+    applied_date timestamptz,
+    application_notes text default '',
+    updated_at timestamptz not null default now()
+);
+
+create table if not exists notes (
+    job_id text primary key,
+    job_result_id bigint references job_results(id) on delete cascade,
+    note_text text default '',
+    updated_at timestamptz not null default now()
+);
+
+create table if not exists saved_profiles (
     profile_name text primary key,
     settings_json jsonb not null,
     updated_at timestamptz not null default now()
@@ -67,3 +83,4 @@ create table if not exists search_profiles (
 create index if not exists idx_job_results_company on job_results(company);
 create index if not exists idx_job_results_run_started_at on job_results(run_started_at desc);
 create index if not exists idx_job_results_application_status on job_results(application_status);
+create index if not exists idx_application_tracker_status on application_tracker(application_status);
