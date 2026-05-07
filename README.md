@@ -99,6 +99,29 @@ The sidebar includes:
 
 Results are deduplicated by job ID, application link, and title/employer/location before relevance filtering.
 
+## SerpAPI Quota Protection
+
+The `Run Search` tab includes an `API Usage / Quota` section. The app checks SerpAPI account usage from the Account API and shows:
+
+- monthly searches used
+- monthly search limit
+- searches remaining
+
+Safe mode is enabled by default and uses conservative limits:
+
+- max companies per run: 2
+- max job titles per run: 2
+- max query variations per company/title: 2
+- max results per company/title: 5
+
+The app estimates API calls before running:
+
+```text
+companies x job titles x query variations
+```
+
+If the estimated calls exceed remaining SerpAPI quota, the run button is blocked until the search size is reduced.
+
 ## Job Relevance Filtering
 
 New searches save jobs with `relevance_score >= 1`. Strong controls, contracts, PMO, planning, scheduler, and risk matches score highest. Broader infrastructure management titles are allowed when paired with construction, rail, transit, metro, infrastructure, water, wastewater, aviation, airport, highway, bridge, tunnel, or design-build context.

@@ -18,6 +18,7 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "job_search.db"
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+SERPAPI_ACCOUNT_ENDPOINT = "https://serpapi.com/account.json"
 
 
 SPONSORSHIP_POSITIVE_PHRASES = (
@@ -765,6 +766,45 @@ def get_serpapi_key() -> str:
         return ""
 
 
+def parse_account_int(payload: dict, field_names: tuple[str, ...]) -> int | None:
+    for field_name in field_names:
+        value = payload.get(field_name)
+        if value is None:
+            continue
+        try:
+            return int(float(str(value).replace(",", "")))
+        except ValueError:
+            continue
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_serpapi_account_usage(api_key: str) -> dict:
+    response = requests.get(SERPAPI_ACCOUNT_ENDPOINT, params={"api_key": api_key}, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    monthly_limit = parse_account_int(
+        payload,
+        ("searches_per_month", "monthly_search_limit", "plan_searches_per_month"),
+    )
+    monthly_used = parse_account_int(
+        payload,
+        ("this_month_usage", "monthly_searches_used", "searches_used"),
+    )
+    searches_remaining = parse_account_int(
+        payload,
+        ("total_searches_left", "searches_remaining", "monthly_searches_left"),
+    )
+    if searches_remaining is None and monthly_limit is not None and monthly_used is not None:
+        searches_remaining = max(0, monthly_limit - monthly_used)
+    return {
+        "monthly_used": monthly_used,
+        "monthly_limit": monthly_limit,
+        "searches_remaining": searches_remaining,
+        "raw": payload,
+    }
+
+
 def phrase_in_text(text: str, phrase: str) -> bool:
     return phrase.lower() in text.lower()
 
@@ -1199,9 +1239,16 @@ def search_google_jobs_query(api_key: str, query: str) -> list[dict]:
     return payload.get("jobs_results", [])
 
 
-def search_google_jobs(api_key: str, company: str, job_title: str, max_jobs: int) -> tuple[list[dict], int, int]:
+def search_google_jobs(
+    api_key: str,
+    company: str,
+    job_title: str,
+    max_jobs: int,
+    max_query_variations: int,
+) -> tuple[list[dict], int, int]:
     raw_jobs = []
-    for query in make_job_search_queries(company, job_title):
+    queries = make_job_search_queries(company, job_title)[:max(1, int(max_query_variations))]
+    for query in queries:
         raw_jobs.extend(search_google_jobs_query(api_key, query))
 
     unique_jobs, duplicates_skipped = deduplicate_jobs(raw_jobs)
@@ -1846,11 +1893,80 @@ def render_upload_section() -> None:
 def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
     st.subheader("Run search")
     api_key = get_serpapi_key()
-    targets = build_search_combinations(companies, job_titles)
     company_count = len(companies) if companies is not None else 0
     job_title_count = len(job_titles) if job_titles is not None else 0
-    saved_target_count = len(targets)
-    active_target_count = len(targets)
+    saved_target_count = company_count * job_title_count
+
+    st.markdown("### API Usage / Quota")
+    account_usage = {"monthly_used": None, "monthly_limit": None, "searches_remaining": None}
+    account_error = ""
+    if api_key:
+        try:
+            account_usage = get_serpapi_account_usage(api_key)
+        except requests.RequestException as exc:
+            account_error = f"Could not check SerpAPI account usage: {exc}"
+    else:
+        st.warning("Missing SERPAPI_API_KEY in Streamlit secrets")
+
+    usage_cols = st.columns(3)
+    usage_cols[0].metric("Monthly searches used", account_usage.get("monthly_used") if account_usage.get("monthly_used") is not None else "Unknown")
+    usage_cols[1].metric("Monthly search limit", account_usage.get("monthly_limit") if account_usage.get("monthly_limit") is not None else "Unknown")
+    usage_cols[2].metric("Searches remaining", account_usage.get("searches_remaining") if account_usage.get("searches_remaining") is not None else "Unknown")
+    if account_error:
+        st.warning(account_error)
+
+    st.markdown("### Usage controls")
+    safe_mode = st.checkbox("Safe mode - reduce API usage", value=True)
+    default_companies = min(2, max(1, company_count)) if safe_mode else min(10, max(1, company_count))
+    default_job_titles = min(2, max(1, job_title_count)) if safe_mode else min(10, max(1, job_title_count))
+    default_query_variations = 2 if safe_mode else len(make_job_search_queries("Company", "Job Title"))
+    default_results = 5 if safe_mode else 10
+
+    control_cols = st.columns(4)
+    max_companies_per_run = control_cols[0].number_input(
+        "Max companies per run",
+        min_value=1,
+        max_value=max(1, company_count),
+        value=default_companies,
+        step=1,
+    )
+    max_job_titles_per_run = control_cols[1].number_input(
+        "Max job titles per run",
+        min_value=1,
+        max_value=max(1, job_title_count),
+        value=default_job_titles,
+        step=1,
+    )
+    max_query_variations = control_cols[2].number_input(
+        "Max query variations per company/title",
+        min_value=1,
+        max_value=len(make_job_search_queries("Company", "Job Title")),
+        value=default_query_variations,
+        step=1,
+    )
+    max_jobs_per_target = control_cols[3].number_input(
+        "Max results per company/title",
+        min_value=3,
+        max_value=20,
+        value=default_results,
+        step=1,
+    )
+
+    selected_companies = companies.head(int(max_companies_per_run)) if companies is not None else pd.DataFrame()
+    selected_job_titles = job_titles.head(int(max_job_titles_per_run)) if job_titles is not None else pd.DataFrame()
+    selected_targets = build_search_combinations(selected_companies, selected_job_titles)
+    active_target_count = len(selected_targets)
+    estimated_api_calls = active_target_count * int(max_query_variations)
+    searches_remaining = account_usage.get("searches_remaining")
+
+    estimate_cols = st.columns(4)
+    estimate_cols[0].metric("Companies this run", len(selected_companies))
+    estimate_cols[1].metric("Job titles this run", len(selected_job_titles))
+    estimate_cols[2].metric("Company/title combos", active_target_count)
+    estimate_cols[3].metric("Estimated API calls", estimated_api_calls)
+
+    if searches_remaining is not None and searches_remaining <= max(10, estimated_api_calls * 2):
+        st.warning("Low SerpAPI quota. Reduce search size.")
 
     disable_reasons = []
     if not api_key:
@@ -1859,14 +1975,16 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
         disable_reasons.append("Please upload targets first in Upload Targets tab")
     elif active_target_count == 0:
         disable_reasons.append("No active company/title pairs")
+    if searches_remaining is not None and estimated_api_calls > searches_remaining:
+        disable_reasons.append("Estimated API calls exceed searches remaining")
 
     disabled_reason = "; ".join(disable_reasons) if disable_reasons else "Button enabled"
     disabled = bool(disable_reasons)
 
-    if not api_key:
-        st.warning("Missing SERPAPI_API_KEY in Streamlit secrets")
     if company_count == 0 or job_title_count == 0:
         st.info("Please upload targets first in Upload Targets tab")
+    if searches_remaining is not None and estimated_api_calls > searches_remaining:
+        st.error("Estimated API calls are greater than your remaining SerpAPI quota. Reduce search size before running.")
 
     st.markdown("### Debug")
     debug_cols = st.columns(4)
@@ -1877,24 +1995,9 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
     st.caption(f"Reason button is disabled: {disabled_reason}")
 
     st.sidebar.header("Search settings")
-    max_jobs_per_target = st.sidebar.slider(
-        "Max jobs per company/title",
-        min_value=3,
-        max_value=20,
-        value=10,
-        step=1,
-    )
     include_broader_infrastructure = st.sidebar.checkbox(
         "Include broader infrastructure management jobs",
         value=True,
-    )
-
-    max_targets = st.number_input(
-        "Maximum company/title pairs to search this run",
-        min_value=1,
-        max_value=max(1, active_target_count),
-        value=max(1, active_target_count),
-        step=1,
     )
     if "last_search_counters" in st.session_state:
         counters = st.session_state["last_search_counters"]
@@ -1910,7 +2013,6 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
         cv_counter_cols[2].metric("Jobs with CV match > 0", counters.get("jobs_with_cv_match", 0))
 
     if st.button("Run Job Search", type="primary", disabled=disabled):
-        selected_targets = targets.head(int(max_targets))
         run_id = make_run_id()
         run_started_at = utc_now()
         progress = st.progress(0)
@@ -1930,6 +2032,7 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
                     row.company,
                     row.job_title,
                     int(max_jobs_per_target),
+                    int(max_query_variations),
                 )
                 inserted, excluded_by_relevance, jobs_with_cv_match = save_job_results(
                     run_id,
