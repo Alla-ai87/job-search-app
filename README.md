@@ -1,33 +1,25 @@
 # U.S. Job Search Streamlit App
 
-This is a Streamlit Cloud app for searching U.S. jobs from an uploaded Excel list of target companies and job titles.
+Streamlit Cloud app for a U.S. infrastructure, construction, PMO, contracts, project controls, planning, scheduler, and risk-focused job search.
 
 ## Features
 
-- Upload an Excel file where Column A is company names and Column B is target job titles.
-- Save target company/title pairs in local SQLite storage.
-- Run multiple Google Jobs searches through SerpAPI for each company/title pair.
-- Save search results while skipping duplicates.
-- Filter results for relevant titles before saving.
-- Save a `relevance_score` and `relevance_reason` for each job.
-- Upload a PDF/DOCX CV and save `cv_match_score` plus `cv_match_reason`.
-- Show a `Top 10 best matches` section sorted by relevance, CV match, salary, and recency.
-- Track each job with status and notes.
-- View saved search run history.
-- Filter the dashboard to show only the top 10 highest relevance jobs per search run.
-- Detect sponsorship status as:
-  - `sponsorship available`
-  - `sponsorship not available`
-  - `not mentioned`
-- View results in a dashboard table.
+- Upload an Excel file where Column A is companies and Column B is target job titles.
+- Store unique companies and unique job titles separately, then search the full `companies x job_titles` combination set.
+- Run multiple SerpAPI Google Jobs queries for each company/title combination.
+- Save deduplicated results with relevance score, sponsorship status, CV match score, tracker status, notes, and search-run history.
+- Review Top 20 best matches sorted by CV match score, relevance, salary, and recency.
+- Upload a PDF/DOCX CV for match scoring.
+- Update application status, applied date, and notes in the Application Tracker.
 - Export filtered results to Excel.
-- Keep SerpAPI keys secure with Streamlit secrets.
+- Use Supabase PostgreSQL for persistent production storage, with local SQLite fallback when Supabase secrets are missing.
 
 ## Files
 
-- `app.py` - Streamlit app and SQLite logic.
+- `app.py` - Streamlit app, search logic, storage logic, CV matching, and tracker.
 - `requirements.txt` - Python dependencies for Streamlit Cloud.
-- `.streamlit/secrets.toml.example` - Example secrets file.
+- `supabase_schema.sql` - Supabase PostgreSQL schema.
+- `.streamlit/secrets.toml.example` - Example secrets file. Do not commit real secrets.
 
 ## Deploy On Streamlit Cloud
 
@@ -36,13 +28,48 @@ This is a Streamlit Cloud app for searching U.S. jobs from an uploaded Excel lis
 3. Create a new app from your GitHub repository.
 4. Set the main file path to `app.py`.
 5. In the Streamlit Cloud app settings, open **Secrets**.
-6. Add your SerpAPI key:
+6. Add your secrets:
 
 ```toml
 SERPAPI_API_KEY = "your_serpapi_key_here"
+
+SUPABASE_URL = "https://your-project-ref.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "your_supabase_service_role_key_here"
 ```
 
 7. Save secrets and deploy the app.
+
+## Supabase Setup
+
+1. Create a Supabase project at [supabase.com](https://supabase.com).
+2. Open the project dashboard.
+3. Go to **SQL Editor**.
+4. Paste and run the full contents of `supabase_schema.sql`.
+5. Go to **Project Settings > API**.
+6. Copy:
+   - Project URL into `SUPABASE_URL`
+   - Service role key into `SUPABASE_SERVICE_ROLE_KEY`
+7. Add both values to Streamlit Cloud **Secrets**.
+
+The service role key must stay server-side only. The app reads it from `st.secrets` and uses it only in backend requests from Streamlit.
+
+## Storage Modes
+
+The app shows one of these messages at startup:
+
+- `Storage mode: Supabase`
+- `Storage mode: temporary local SQLite`
+
+When Supabase secrets are present, the app stores and loads data from Supabase:
+
+- companies
+- target job titles
+- job results
+- search runs
+- application status, applied date, and notes
+- CV text/profile data
+
+When Supabase secrets are missing, the app falls back to `job_search.db` next to `app.py`. This is useful for local testing, but Streamlit Cloud can rebuild local storage, so Supabase is recommended for permanent history.
 
 ## Excel Upload Format
 
@@ -52,77 +79,7 @@ The uploaded spreadsheet should use the first two columns:
 | --- | --- |
 | Company name | Target job title |
 
-Rows with blank companies or blank job titles are ignored. Duplicate company/title pairs are skipped.
-
-## Local Storage
-
-The app uses SQLite and creates `job_search.db` next to `app.py`.
-
-On Streamlit Cloud, this storage is simple app-local storage. It is useful for lightweight workflows, but it may reset if the app environment is rebuilt. For long-term production storage, replace SQLite with a hosted database.
-
-## Security
-
-The SerpAPI key is read only from `st.secrets["SERPAPI_API_KEY"]`.
-
-The app never prints API keys, stores them in the database, or sends them to the browser.
-
-## Job Relevance Filtering
-
-The app lowercases each job title and applies balanced relevance scoring to new searches only. Existing saved jobs are not deleted automatically.
-
-Strong title matches add 3 points:
-
-- `project controls`
-- `program controls`
-- `contracts`
-- `contract manager`
-- `contract management`
-- `pmo`
-- `risk manager`
-- `scheduler`
-- `planning manager`
-
-Infrastructure management roles can be included when paired with infrastructure context. The role adds 1 point:
-
-- `project manager`
-- `senior project manager`
-- `construction manager`
-- `controls manager`
-- `program manager`
-
-Infrastructure context adds 1 point:
-
-- `construction`
-- `rail`
-- `transit`
-- `metro`
-- `infrastructure`
-- `water`
-- `wastewater`
-- `aviation`
-- `airport`
-- `highway`
-- `bridge`
-- `tunnel`
-- `design-build`
-
-Generic project-manager titles score only when infrastructure context is also present.
-
-These terms reject the job immediately:
-
-- `software`
-- `developer`
-- `cloud`
-- `network`
-- `IT`
-- `technician`
-- `inspector`
-- `architect`
-- `data center`
-
-Jobs with `relevance_score` below 1 are not saved in new searches. Saved rows include `relevance_reason`, which explains strong matches, infrastructure context, or exclusion reasons.
-
-The dashboard includes a `Top 10 best matches` section sorted by `relevance_score`, `cv_match_score`, salary when available, and posting recency from `posted_at`. It also includes optional filters for `Show only top 10 highest relevance jobs per run` and a `Minimum relevance score` slider with a default of 2 and range from 1 to 5. New searches are saved with a run ID so each run can be ranked separately.
+The app removes blanks, skips header values like `Company` and `Job title`, deduplicates values, saves companies and job titles separately, and searches every company against every target title.
 
 ## Search Coverage
 
@@ -142,73 +99,39 @@ The sidebar includes:
 
 Results are deduplicated by job ID, application link, and title/employer/location before relevance filtering.
 
+## Job Relevance Filtering
+
+New searches save jobs with `relevance_score >= 1`. Strong controls, contracts, PMO, planning, scheduler, and risk matches score highest. Broader infrastructure management titles are allowed when paired with construction, rail, transit, metro, infrastructure, water, wastewater, aviation, airport, highway, bridge, tunnel, or design-build context.
+
+Clearly irrelevant terms such as software, developer, cloud, network, IT, technician, inspector, architect, and data center are rejected before saving.
+
 ## Sponsorship Detection
 
 For new searches, the app checks job title, description, and application text when available.
 
-Positive phrases mark the job `sponsorship available`:
-
-- `visa sponsorship`
-- `sponsorship available`
-- `we sponsor`
-- `H1B`
-- `relocation support`
-
-Negative phrases mark the job `sponsorship not available`:
-
-- `no sponsorship`
-- `not eligible for sponsorship`
-- `must be authorized to work`
-- `no visa support`
-
-Authorization phrases such as `work authorization`, `authorized to work`, `work permit`, and `employment authorization` mark the job `requires work authorization`.
-
-If no phrase matches, the job is marked `not mentioned`.
-
-Saved rows include `sponsorship_reason`, which stores the phrase that triggered the classification. The dashboard can filter to `Show only jobs with possible sponsorship`, and `sponsorship available` rows are highlighted in green.
-
-## Tabs
-
-- `Upload Targets` - Upload Excel target companies and job titles.
-- `Run Search` - Run SerpAPI searches and view saved search runs.
-- `Dashboard` - Filter, review, and export full results.
-- `Top Matches` - Review the best 10 matches ranked by relevance, CV match, salary, and recency.
-- `Application Tracker` - Update status and notes for saved jobs.
-- `Settings` - Upload CV and extract resume text.
+Positive phrases mark the job `sponsorship available`; negative phrases mark it `sponsorship not available`; authorization phrases mark it `requires work authorization`; otherwise it is `not mentioned`.
 
 ## CV Matching
 
 Upload a PDF or DOCX CV in `Settings`, then run a new search. New saved jobs receive:
 
 - `cv_match_score`, from 0 to 100.
-- `cv_match_reason`, showing overlapping CV keywords.
+- `cv_match_reason`, showing matched senior infrastructure PMO, controls, contracts, planning, scheduling, risk, industry, and seniority terms.
 
 ## Application Tracker
 
-Saved jobs include:
+Use the `Application Tracker` tab to update:
 
-- `status`: `New`, `Interested`, `Applied`, `Rejected`, `Interview`, or `Archived`.
-- `notes`: editable free-text notes.
+- `application_status`: `New`, `Interested`, `Applied`, `Interview`, `Offer`, `Rejected`, or `Archived`
+- `applied_date`
+- `application_notes`
 
-Use the `Application Tracker` tab to update these fields.
+Updates are persisted in Supabase when configured, or SQLite fallback otherwise.
 
 ## Export
 
-The dashboard export includes:
+The dashboard export includes user-facing fields by default. `searched_job_title`, `run_id`, and `run_started_at` are included only when the related export checkboxes are enabled. `Job ID` is included as the first column.
 
-- `company`
-- `searched_job_title`
-- `title`
-- `employer_name`
-- `location`
-- `salary`
-- `posted_at`
-- `sponsorship_status`
-- `sponsorship_reason`
-- `relevance_score`
-- `relevance_reason`
-- `cv_match_score`
-- `cv_match_reason`
-- `status`
-- `notes`
-- `apply_link`
+## Security
+
+API keys and Supabase credentials are read only from Streamlit secrets. They are never stored in the database, printed, or exposed in the frontend.

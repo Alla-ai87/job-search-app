@@ -97,6 +97,113 @@ ACTIVE_APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Off
 COMPANY_HEADER_VALUES = {"company", "companies"}
 JOB_TITLE_HEADER_VALUES = {"job title", "job titles", "target job title", "target job titles"}
 
+RESULT_COLUMNS = [
+    "id",
+    "run_id",
+    "run_started_at",
+    "company",
+    "searched_job_title",
+    "title",
+    "employer_name",
+    "location",
+    "via",
+    "posted_at",
+    "schedule_type",
+    "salary",
+    "sponsorship_status",
+    "sponsorship_reason",
+    "relevance_score",
+    "relevance_reason",
+    "cv_match_score",
+    "cv_match_reason",
+    "status",
+    "notes",
+    "application_status",
+    "applied_date",
+    "application_notes",
+    "job_url",
+    "apply_link",
+    "description",
+    "created_at",
+]
+
+
+def get_supabase_credentials() -> tuple[str, str]:
+    try:
+        url = clean_text(st.secrets["SUPABASE_URL"]).rstrip("/")
+        key = clean_text(st.secrets["SUPABASE_SERVICE_ROLE_KEY"])
+    except Exception:
+        return "", ""
+    return url, key
+
+
+def is_supabase_enabled() -> bool:
+    url, key = get_supabase_credentials()
+    return bool(url and key)
+
+
+def storage_mode_label() -> str:
+    return "Supabase" if is_supabase_enabled() else "temporary local SQLite"
+
+
+def supabase_headers(prefer: str = "") -> dict[str, str]:
+    _, key = get_supabase_credentials()
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def supabase_table_url(table_name: str) -> str:
+    url, _ = get_supabase_credentials()
+    return f"{url}/rest/v1/{table_name}"
+
+
+def supabase_request(
+    method: str,
+    table_name: str,
+    params: dict[str, object] | None = None,
+    json_body: object | None = None,
+    prefer: str = "",
+) -> object:
+    response = requests.request(
+        method,
+        supabase_table_url(table_name),
+        headers=supabase_headers(prefer),
+        params=params,
+        json=json_body,
+        timeout=45,
+    )
+    response.raise_for_status()
+    if not response.content:
+        return []
+    return response.json()
+
+
+def supabase_upsert(table_name: str, rows: list[dict], conflict_column: str) -> object:
+    if not rows:
+        return []
+    return supabase_request(
+        "POST",
+        table_name,
+        params={"on_conflict": conflict_column},
+        json_body=rows,
+        prefer="resolution=merge-duplicates,return=representation,missing=default",
+    )
+
+
+def dataframe_from_rows(rows: object, columns: list[str]) -> pd.DataFrame:
+    df = pd.DataFrame(rows or [])
+    for column in columns:
+        if column not in df.columns:
+            df[column] = ""
+    return df[columns]
+
 
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -241,6 +348,21 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cv_profiles (
+                profile_key TEXT PRIMARY KEY,
+                cv_text TEXT,
+                cv_summary TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+def init_storage() -> None:
+    if not is_supabase_enabled():
+        init_db()
 
 
 def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
@@ -276,6 +398,21 @@ def load_targets_from_excel(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame) -> tuple[int, int]:
     created_at = utc_now()
+    if is_supabase_enabled():
+        company_rows = [
+            {"company": clean_text(row.company), "created_at": created_at}
+            for row in companies_df.itertuples(index=False)
+            if clean_text(row.company)
+        ]
+        job_title_rows = [
+            {"job_title": clean_text(row.job_title), "created_at": created_at}
+            for row in job_titles_df.itertuples(index=False)
+            if clean_text(row.job_title)
+        ]
+        supabase_upsert("companies", company_rows, "company")
+        supabase_upsert("target_job_titles", job_title_rows, "job_title")
+        return len(company_rows), len(job_title_rows)
+
     inserted_companies = 0
     inserted_job_titles = 0
     with get_connection() as conn:
@@ -301,6 +438,14 @@ def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame) -> tup
 
 
 def get_companies() -> pd.DataFrame:
+    if is_supabase_enabled():
+        rows = supabase_request(
+            "GET",
+            "companies",
+            params={"select": "company,created_at", "order": "company.asc"},
+        )
+        return dataframe_from_rows(rows, ["company", "created_at"])
+
     with get_connection() as conn:
         return pd.read_sql_query(
             "SELECT company, created_at FROM companies ORDER BY company",
@@ -309,6 +454,14 @@ def get_companies() -> pd.DataFrame:
 
 
 def get_target_job_titles() -> pd.DataFrame:
+    if is_supabase_enabled():
+        rows = supabase_request(
+            "GET",
+            "target_job_titles",
+            params={"select": "job_title,created_at", "order": "job_title.asc"},
+        )
+        return dataframe_from_rows(rows, ["job_title", "created_at"])
+
     with get_connection() as conn:
         return pd.read_sql_query(
             "SELECT job_title, created_at FROM target_job_titles ORDER BY job_title",
@@ -368,6 +521,21 @@ def display_job_id_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_results() -> pd.DataFrame:
+    if is_supabase_enabled():
+        rows = supabase_request(
+            "GET",
+            "job_results",
+            params={"select": ",".join(RESULT_COLUMNS), "order": "created_at.desc"},
+        )
+        results = dataframe_from_rows(rows, RESULT_COLUMNS)
+        if not results.empty:
+            results = results.sort_values(
+                by=["run_started_at", "created_at", "relevance_score"],
+                ascending=[False, False, False],
+                na_position="last",
+            )
+        return ensure_job_ids(results)
+
     with get_connection() as conn:
         results = pd.read_sql_query(
             """
@@ -408,6 +576,27 @@ def get_results() -> pd.DataFrame:
 
 
 def get_search_runs() -> pd.DataFrame:
+    if is_supabase_enabled():
+        rows = supabase_request(
+            "GET",
+            "search_runs",
+            params={
+                "select": "run_id,run_started_at,raw_jobs_found,duplicates_skipped,excluded_by_relevance,jobs_saved",
+                "order": "run_started_at.desc",
+            },
+        )
+        return dataframe_from_rows(
+            rows,
+            [
+                "run_id",
+                "run_started_at",
+                "raw_jobs_found",
+                "duplicates_skipped",
+                "excluded_by_relevance",
+                "jobs_saved",
+            ],
+        )
+
     with get_connection() as conn:
         return pd.read_sql_query(
             """
@@ -433,6 +622,23 @@ def save_search_run(
     excluded_by_relevance: int,
     jobs_saved: int,
 ) -> None:
+    if is_supabase_enabled():
+        supabase_upsert(
+            "search_runs",
+            [
+                {
+                    "run_id": run_id,
+                    "run_started_at": run_started_at,
+                    "raw_jobs_found": raw_jobs_found,
+                    "duplicates_skipped": duplicates_skipped,
+                    "excluded_by_relevance": excluded_by_relevance,
+                    "jobs_saved": jobs_saved,
+                }
+            ],
+            "run_id",
+        )
+        return
+
     with get_connection() as conn:
         conn.execute(
             """
@@ -459,6 +665,22 @@ def save_search_run(
 def update_job_tracking(job_id: int, application_status: str, application_notes: str, applied_date: str = "") -> None:
     if application_status not in APPLICATION_STATUSES:
         application_status = "New"
+    if is_supabase_enabled():
+        supabase_request(
+            "PATCH",
+            "job_results",
+            params={"id": f"eq.{job_id}"},
+            json_body={
+                "application_status": application_status,
+                "application_notes": application_notes,
+                "applied_date": applied_date or None,
+                "status": application_status,
+                "notes": application_notes,
+            },
+            prefer="return=minimal",
+        )
+        return
+
     with get_connection() as conn:
         conn.execute(
             """
@@ -473,6 +695,58 @@ def update_job_tracking(job_id: int, application_status: str, application_notes:
             """,
             (application_status, application_notes, applied_date, application_status, application_notes, job_id),
         )
+
+
+def save_cv_profile(cv_text: str, cv_summary: str = "") -> None:
+    updated_at = utc_now()
+    if is_supabase_enabled():
+        supabase_upsert(
+            "cv_profiles",
+            [
+                {
+                    "profile_key": "default",
+                    "cv_text": cv_text,
+                    "cv_summary": cv_summary,
+                    "updated_at": updated_at,
+                }
+            ],
+            "profile_key",
+        )
+        return
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO cv_profiles (profile_key, cv_text, cv_summary, updated_at)
+            VALUES ('default', ?, ?, ?)
+            ON CONFLICT(profile_key) DO UPDATE SET
+                cv_text = excluded.cv_text,
+                cv_summary = excluded.cv_summary,
+                updated_at = excluded.updated_at
+            """,
+            (cv_text, cv_summary, updated_at),
+        )
+
+
+def get_cv_profile() -> tuple[str, str]:
+    if is_supabase_enabled():
+        rows = supabase_request(
+            "GET",
+            "cv_profiles",
+            params={"select": "cv_text,cv_summary", "profile_key": "eq.default", "limit": 1},
+        )
+        if rows:
+            row = rows[0]
+            return clean_text(row.get("cv_text")), clean_text(row.get("cv_summary"))
+        return "", ""
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT cv_text, cv_summary FROM cv_profiles WHERE profile_key = 'default'"
+        ).fetchone()
+    if not row:
+        return "", ""
+    return clean_text(row["cv_text"]), clean_text(row["cv_summary"])
 
 
 def utc_now() -> str:
@@ -934,6 +1208,83 @@ def search_google_jobs(api_key: str, company: str, job_title: str, max_jobs: int
     return unique_jobs[:max_jobs], len(raw_jobs), duplicates_skipped
 
 
+def save_job_results_supabase(
+    run_id: str,
+    run_started_at: str,
+    company: str,
+    searched_job_title: str,
+    jobs: list[dict],
+    relevance_threshold: int,
+    include_broader_infrastructure: bool,
+    cv_text: str = "",
+) -> tuple[int, int, int]:
+    created_at = utc_now()
+    rows = []
+    skipped = 0
+    cv_positive_count = 0
+    for job in jobs:
+        active_cv_text = clean_text(cv_text) or clean_text(st.session_state.get("cv_text", ""))
+        title = clean_text(job.get("title"))
+        description = clean_text(job.get("description"))
+        relevance_score = calculate_relevance(title, description, include_broader_infrastructure)
+        print("TITLE:", title, "SCORE:", relevance_score)
+        _, relevance_reason, is_excluded = score_job_relevance(title, description, include_broader_infrastructure)
+        if is_excluded:
+            skipped += 1
+            continue
+        if relevance_score < relevance_threshold:
+            skipped += 1
+            continue
+
+        employer_name = get_employer_name(job)
+        location = clean_text(job.get("location"))
+        apply_link = best_apply_link(job)
+        job_url = normalize_job_url(job)
+        application_text = collect_application_text(job)
+        sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
+        cv_match_score, cv_match_reason = calculate_cv_match(
+            title,
+            employer_name,
+            description,
+            searched_job_title,
+            active_cv_text,
+        )
+        if cv_match_score > 0:
+            cv_positive_count += 1
+
+        rows.append(
+            {
+                "result_key": make_result_key(company, searched_job_title, job),
+                "run_id": run_id,
+                "run_started_at": run_started_at,
+                "company": company,
+                "searched_job_title": searched_job_title,
+                "title": title,
+                "employer_name": employer_name,
+                "location": location,
+                "via": clean_text(job.get("via")),
+                "posted_at": clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at")),
+                "schedule_type": clean_text(job.get("detected_extensions", {}).get("schedule_type")),
+                "salary": get_salary(job),
+                "description": description,
+                "job_url": job_url,
+                "apply_link": apply_link,
+                "sponsorship_status": sponsorship_status,
+                "sponsorship_reason": sponsorship_reason,
+                "relevance_score": int(relevance_score),
+                "relevance_reason": relevance_reason,
+                "cv_match_score": int(cv_match_score),
+                "cv_match_reason": cv_match_reason,
+                "raw_json": job,
+                "created_at": created_at,
+            }
+        )
+
+    if rows:
+        supabase_upsert("job_results", rows, "result_key")
+    return len(rows), skipped, cv_positive_count
+
+
 def save_job_results(
     run_id: str,
     run_started_at: str,
@@ -944,6 +1295,18 @@ def save_job_results(
     include_broader_infrastructure: bool,
     cv_text: str = "",
 ) -> tuple[int, int, int]:
+    if is_supabase_enabled():
+        return save_job_results_supabase(
+            run_id,
+            run_started_at,
+            company,
+            searched_job_title,
+            jobs,
+            relevance_threshold,
+            include_broader_infrastructure,
+            cv_text,
+        )
+
     created_at = utc_now()
     inserted = 0
     skipped = 0
@@ -1467,10 +1830,16 @@ def render_upload_section() -> None:
 
     if st.button("Save Uploaded Targets", type="primary"):
         inserted_companies, inserted_job_titles = save_targets(companies_df, job_titles_df)
-        st.success(
-            f"Saved {inserted_companies} new companies and {inserted_job_titles} new job titles. "
-            "Existing duplicates were skipped."
-        )
+        if is_supabase_enabled():
+            st.success(
+                f"Saved/updated {inserted_companies} companies and {inserted_job_titles} job titles in Supabase. "
+                "Existing duplicates were kept as one saved value."
+            )
+        else:
+            st.success(
+                f"Saved {inserted_companies} new companies and {inserted_job_titles} new job titles. "
+                "Existing duplicates were skipped."
+            )
         st.rerun()
 
 
@@ -1910,6 +2279,7 @@ def render_settings(results: pd.DataFrame) -> None:
                 st.warning("This PDF may be scanned. Please upload DOCX instead.")
                 return
             st.session_state["cv_text"] = cv_text
+            save_cv_profile(cv_text)
             st.success(f"CV text extracted: {len(cv_text):,} characters.")
         except Exception:
             st.error("Could not read file, please try another format")
@@ -1919,10 +2289,16 @@ def render_settings(results: pd.DataFrame) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="U.S. Job Search", layout="wide")
-    init_db()
+    init_storage()
 
     st.title("U.S. Job Search")
     st.caption("Upload target companies and roles, search Google Jobs through SerpAPI, and export deduplicated results.")
+    st.info(f"Storage mode: {storage_mode_label()}")
+
+    if "cv_text" not in st.session_state or not clean_text(st.session_state.get("cv_text")):
+        saved_cv_text, _ = get_cv_profile()
+        if saved_cv_text:
+            st.session_state["cv_text"] = saved_cv_text
 
     companies = get_companies()
     job_titles = get_target_job_titles()
