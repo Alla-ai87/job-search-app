@@ -71,6 +71,26 @@ When Supabase secrets are present, the app stores and loads data from Supabase:
 
 When Supabase secrets are missing, the app falls back to `job_search.db` next to `app.py`. This is useful for local testing, but Streamlit Cloud can rebuild local storage, so Supabase is recommended for permanent history.
 
+## Historical Results
+
+On startup, the app automatically loads previously saved jobs and search runs from the active storage layer. This does not call SerpAPI and works even when quota is exhausted.
+
+The top of the app shows `Last saved search run` with:
+
+- `run_id`
+- `run_started_at`
+- jobs saved
+- companies searched
+
+Use the historical controls to reopen old results:
+
+- `Today`
+- `Last 7 days`
+- `All history`
+- `By run_id`
+
+The `Load previous run` dropdown filters Dashboard, Top Matches, and Application Tracker to a saved run without running a new search. New searches append new run IDs and do not overwrite older results.
+
 ## Excel Upload Format
 
 The uploaded spreadsheet should use the first two columns:
@@ -107,6 +127,8 @@ The `Run Search` tab includes an `API Usage / Quota` section. The app checks Ser
 - monthly search limit
 - searches remaining
 
+Quota is checked only when you click `Check SerpAPI quota` or `Run Job Search`, so opening historical results does not consume SerpAPI calls.
+
 Safe mode is enabled by default and uses conservative limits:
 
 - max companies per run: 2
@@ -121,6 +143,18 @@ companies x job titles x query variations
 ```
 
 If the estimated calls exceed remaining SerpAPI quota, the run button is blocked until the search size is reduced.
+
+## Search Profiles
+
+The `Run Search` tab includes three search profiles:
+
+- `Safe Mode`: conservative defaults for low API usage.
+- `Balanced Mode`: moderate coverage.
+- `Full / Maximum Mode`: all companies, all job titles, all query variations, and max results per company/title unless you saved a custom Full Search profile.
+
+Use `Save current settings as Full Search` to persist the current controls as your Full Search profile. Use `Load Full Search settings` to reload it later. Loading a profile does not run a search.
+
+Full Search is intended for after API quota renews. The app still checks SerpAPI quota before running and blocks the run when estimated API calls exceed remaining quota.
 
 ## Job Relevance Filtering
 

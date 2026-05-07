@@ -359,6 +359,15 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_profiles (
+                profile_name TEXT PRIMARY KEY,
+                settings_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def init_storage() -> None:
@@ -750,6 +759,62 @@ def get_cv_profile() -> tuple[str, str]:
     return clean_text(row["cv_text"]), clean_text(row["cv_summary"])
 
 
+def save_search_profile(profile_name: str, settings: dict[str, int]) -> None:
+    updated_at = utc_now()
+    payload = json.dumps(settings)
+    if is_supabase_enabled():
+        supabase_upsert(
+            "search_profiles",
+            [
+                {
+                    "profile_name": profile_name,
+                    "settings_json": settings,
+                    "updated_at": updated_at,
+                }
+            ],
+            "profile_name",
+        )
+        return
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO search_profiles (profile_name, settings_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(profile_name) DO UPDATE SET
+                settings_json = excluded.settings_json,
+                updated_at = excluded.updated_at
+            """,
+            (profile_name, payload, updated_at),
+        )
+
+
+def get_search_profile(profile_name: str) -> dict[str, int]:
+    if is_supabase_enabled():
+        rows = supabase_request(
+            "GET",
+            "search_profiles",
+            params={"select": "settings_json", "profile_name": f"eq.{profile_name}", "limit": 1},
+        )
+        if not rows:
+            return {}
+        settings = rows[0].get("settings_json") or {}
+        return settings if isinstance(settings, dict) else {}
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT settings_json FROM search_profiles WHERE profile_name = ?",
+            (profile_name,),
+        ).fetchone()
+    if not row:
+        return {}
+    try:
+        settings = json.loads(row["settings_json"])
+    except json.JSONDecodeError:
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -803,6 +868,11 @@ def get_serpapi_account_usage(api_key: str) -> dict:
         "searches_remaining": searches_remaining,
         "raw": payload,
     }
+
+
+def quota_value(account_usage: dict, key: str) -> object:
+    value = account_usage.get(key)
+    return value if value is not None else "Unknown"
 
 
 def phrase_in_text(text: str, phrase: str) -> bool:
@@ -1890,6 +1960,56 @@ def render_upload_section() -> None:
         st.rerun()
 
 
+def clamp_int(value: object, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = minimum
+    return max(minimum, min(maximum, parsed))
+
+
+def search_profile_defaults(profile_name: str, company_count: int, job_title_count: int, max_query_variations: int) -> dict[str, int]:
+    if profile_name == "Balanced Mode":
+        return {
+            "max_companies_per_run": min(5, max(1, company_count)),
+            "max_job_titles_per_run": min(5, max(1, job_title_count)),
+            "max_query_variations": min(4, max_query_variations),
+            "max_jobs_per_target": 10,
+        }
+    if profile_name == "Full / Maximum Mode":
+        saved_settings = get_search_profile("Full Search")
+        if saved_settings:
+            return saved_settings
+        return {
+            "max_companies_per_run": max(1, company_count),
+            "max_job_titles_per_run": max(1, job_title_count),
+            "max_query_variations": max_query_variations,
+            "max_jobs_per_target": 20,
+        }
+    return {
+        "max_companies_per_run": min(2, max(1, company_count)),
+        "max_job_titles_per_run": min(2, max(1, job_title_count)),
+        "max_query_variations": min(2, max_query_variations),
+        "max_jobs_per_target": 5,
+    }
+
+
+def apply_search_settings(settings: dict[str, int], company_count: int, job_title_count: int, max_query_variations: int) -> None:
+    st.session_state["max_companies_per_run"] = clamp_int(settings.get("max_companies_per_run"), 1, max(1, company_count))
+    st.session_state["max_job_titles_per_run"] = clamp_int(settings.get("max_job_titles_per_run"), 1, max(1, job_title_count))
+    st.session_state["max_query_variations"] = clamp_int(settings.get("max_query_variations"), 1, max_query_variations)
+    st.session_state["max_jobs_per_target"] = clamp_int(settings.get("max_jobs_per_target"), 3, 20)
+
+
+def current_search_settings() -> dict[str, int]:
+    return {
+        "max_companies_per_run": int(st.session_state.get("max_companies_per_run", 1)),
+        "max_job_titles_per_run": int(st.session_state.get("max_job_titles_per_run", 1)),
+        "max_query_variations": int(st.session_state.get("max_query_variations", 1)),
+        "max_jobs_per_target": int(st.session_state.get("max_jobs_per_target", 5)),
+    }
+
+
 def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
     st.subheader("Run search")
     api_key = get_serpapi_key()
@@ -1898,59 +2018,101 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
     saved_target_count = company_count * job_title_count
 
     st.markdown("### API Usage / Quota")
-    account_usage = {"monthly_used": None, "monthly_limit": None, "searches_remaining": None}
-    account_error = ""
-    if api_key:
+    account_usage = st.session_state.get(
+        "serpapi_account_usage",
+        {"monthly_used": None, "monthly_limit": None, "searches_remaining": None},
+    )
+    if not api_key:
+        st.warning("Missing SERPAPI_API_KEY in Streamlit secrets")
+    if st.button("Check SerpAPI quota", disabled=not bool(api_key)):
         try:
             account_usage = get_serpapi_account_usage(api_key)
+            st.session_state["serpapi_account_usage"] = account_usage
         except requests.RequestException as exc:
-            account_error = f"Could not check SerpAPI account usage: {exc}"
-    else:
-        st.warning("Missing SERPAPI_API_KEY in Streamlit secrets")
+            st.warning(f"Could not check SerpAPI account usage: {exc}")
 
     usage_cols = st.columns(3)
-    usage_cols[0].metric("Monthly searches used", account_usage.get("monthly_used") if account_usage.get("monthly_used") is not None else "Unknown")
-    usage_cols[1].metric("Monthly search limit", account_usage.get("monthly_limit") if account_usage.get("monthly_limit") is not None else "Unknown")
-    usage_cols[2].metric("Searches remaining", account_usage.get("searches_remaining") if account_usage.get("searches_remaining") is not None else "Unknown")
-    if account_error:
-        st.warning(account_error)
+    usage_cols[0].metric("Monthly searches used", quota_value(account_usage, "monthly_used"))
+    usage_cols[1].metric("Monthly search limit", quota_value(account_usage, "monthly_limit"))
+    usage_cols[2].metric("Searches remaining", quota_value(account_usage, "searches_remaining"))
 
     st.markdown("### Usage controls")
-    safe_mode = st.checkbox("Safe mode - reduce API usage", value=True)
-    default_companies = min(2, max(1, company_count)) if safe_mode else min(10, max(1, company_count))
-    default_job_titles = min(2, max(1, job_title_count)) if safe_mode else min(10, max(1, job_title_count))
-    default_query_variations = 2 if safe_mode else len(make_job_search_queries("Company", "Job Title"))
-    default_results = 5 if safe_mode else 10
+    max_query_variation_count = len(make_job_search_queries("Company", "Job Title"))
+    pending_profile = st.session_state.pop("pending_search_profile", "")
+    if pending_profile:
+        apply_search_settings(
+            search_profile_defaults(pending_profile, company_count, job_title_count, max_query_variation_count),
+            company_count,
+            job_title_count,
+            max_query_variation_count,
+        )
+        st.session_state["active_search_profile"] = pending_profile
+
+    selected_profile = st.selectbox(
+        "Search profile",
+        options=["Safe Mode", "Balanced Mode", "Full / Maximum Mode"],
+        index=["Safe Mode", "Balanced Mode", "Full / Maximum Mode"].index(
+            st.session_state.get("active_search_profile", "Safe Mode")
+        ),
+    )
+    if st.session_state.get("active_search_profile") != selected_profile:
+        apply_search_settings(
+            search_profile_defaults(selected_profile, company_count, job_title_count, max_query_variation_count),
+            company_count,
+            job_title_count,
+            max_query_variation_count,
+        )
+        st.session_state["active_search_profile"] = selected_profile
+
+    safe_mode = st.checkbox("Safe mode - reduce API usage", value=selected_profile == "Safe Mode")
+    if safe_mode and selected_profile != "Safe Mode" and st.session_state.get("safe_mode_forced_profile") != selected_profile:
+        apply_search_settings(
+            search_profile_defaults("Safe Mode", company_count, job_title_count, max_query_variation_count),
+            company_count,
+            job_title_count,
+            max_query_variation_count,
+        )
+        st.session_state["safe_mode_forced_profile"] = selected_profile
+
+    st.caption("Use Full Search only after API quota renews.")
 
     control_cols = st.columns(4)
     max_companies_per_run = control_cols[0].number_input(
         "Max companies per run",
         min_value=1,
         max_value=max(1, company_count),
-        value=default_companies,
         step=1,
+        key="max_companies_per_run",
     )
     max_job_titles_per_run = control_cols[1].number_input(
         "Max job titles per run",
         min_value=1,
         max_value=max(1, job_title_count),
-        value=default_job_titles,
         step=1,
+        key="max_job_titles_per_run",
     )
     max_query_variations = control_cols[2].number_input(
         "Max query variations per company/title",
         min_value=1,
-        max_value=len(make_job_search_queries("Company", "Job Title")),
-        value=default_query_variations,
+        max_value=max_query_variation_count,
         step=1,
+        key="max_query_variations",
     )
     max_jobs_per_target = control_cols[3].number_input(
         "Max results per company/title",
         min_value=3,
         max_value=20,
-        value=default_results,
         step=1,
+        key="max_jobs_per_target",
     )
+    profile_cols = st.columns(2)
+    if profile_cols[0].button("Save current settings as Full Search"):
+        save_search_profile("Full Search", current_search_settings())
+        st.success("Saved current settings as Full Search.")
+    if profile_cols[1].button("Load Full Search settings"):
+        st.session_state["pending_search_profile"] = "Full / Maximum Mode"
+        st.success("Loaded Full Search settings. Search was not run.")
+        st.rerun()
 
     selected_companies = companies.head(int(max_companies_per_run)) if companies is not None else pd.DataFrame()
     selected_job_titles = job_titles.head(int(max_job_titles_per_run)) if job_titles is not None else pd.DataFrame()
@@ -2013,6 +2175,17 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
         cv_counter_cols[2].metric("Jobs with CV match > 0", counters.get("jobs_with_cv_match", 0))
 
     if st.button("Run Job Search", type="primary", disabled=disabled):
+        try:
+            account_usage = get_serpapi_account_usage(api_key)
+            st.session_state["serpapi_account_usage"] = account_usage
+            searches_remaining = account_usage.get("searches_remaining")
+        except requests.RequestException as exc:
+            st.error(f"Could not check SerpAPI quota before running search: {exc}")
+            return
+        if searches_remaining is not None and estimated_api_calls > searches_remaining:
+            st.error("Estimated API calls are greater than your remaining SerpAPI quota. Reduce search size before running.")
+            return
+
         run_id = make_run_id()
         run_started_at = utc_now()
         progress = st.progress(0)
@@ -2390,6 +2563,88 @@ def render_settings(results: pd.DataFrame) -> None:
         st.caption(f"Current CV text loaded: {len(st.session_state['cv_text']):,} characters.")
 
 
+def run_timestamp_series(results: pd.DataFrame) -> pd.Series:
+    if results.empty:
+        return pd.Series(dtype="datetime64[ns, UTC]")
+    source = results["run_started_at"] if "run_started_at" in results.columns else pd.Series([""] * len(results))
+    created = results["created_at"] if "created_at" in results.columns else pd.Series([""] * len(results))
+    timestamps = pd.to_datetime(source, errors="coerce", utc=True)
+    created_timestamps = pd.to_datetime(created, errors="coerce", utc=True)
+    return timestamps.fillna(created_timestamps)
+
+
+def latest_run_id(search_runs: pd.DataFrame, results: pd.DataFrame) -> str:
+    if not search_runs.empty and "run_id" in search_runs.columns:
+        return clean_text(search_runs.iloc[0].get("run_id"))
+    if not results.empty and "run_id" in results.columns:
+        timestamps = run_timestamp_series(results)
+        if not timestamps.empty and timestamps.notna().any():
+            return clean_text(results.loc[timestamps.idxmax()].get("run_id"))
+    return ""
+
+
+def render_history_overview(results: pd.DataFrame, search_runs: pd.DataFrame) -> pd.DataFrame:
+    st.markdown("### Last saved search run")
+    if not is_supabase_enabled():
+        st.warning("Temporary local storage may reset.")
+
+    if results.empty and search_runs.empty:
+        st.info("No historical job results are saved yet.")
+        return results
+
+    last_run_id = latest_run_id(search_runs, results)
+    last_run = pd.Series(dtype=object)
+    if last_run_id and not search_runs.empty:
+        matching_runs = search_runs[search_runs["run_id"].map(clean_text) == last_run_id]
+        if not matching_runs.empty:
+            last_run = matching_runs.iloc[0]
+
+    last_run_results = results[results["run_id"].map(clean_text) == last_run_id] if last_run_id and "run_id" in results.columns else pd.DataFrame()
+    last_cols = st.columns(4)
+    last_cols[0].metric("run_id", last_run_id or "Unknown")
+    last_cols[1].metric("run_started_at", clean_text(last_run.get("run_started_at", "")) or "Unknown")
+    last_cols[2].metric("jobs saved", clean_text(last_run.get("jobs_saved", "")) or len(last_run_results))
+    last_cols[3].metric("companies searched", last_run_results["company"].nunique() if not last_run_results.empty and "company" in last_run_results.columns else 0)
+
+    st.markdown("### Historical results")
+    run_ids = []
+    if "run_id" in results.columns:
+        run_ids = [run_id for run_id in results["run_id"].map(clean_text).drop_duplicates().tolist() if run_id]
+    if not run_ids and not search_runs.empty and "run_id" in search_runs.columns:
+        run_ids = [run_id for run_id in search_runs["run_id"].map(clean_text).drop_duplicates().tolist() if run_id]
+
+    filter_col, run_col = st.columns([1, 2])
+    history_filter = filter_col.selectbox(
+        "History filter",
+        options=["Today", "Last 7 days", "All history", "By run_id"],
+        index=2,
+    )
+    run_options = ["All runs", *run_ids]
+    default_run_index = run_options.index(last_run_id) if last_run_id in run_options else 0
+    selected_run_id = run_col.selectbox("Load previous run", options=run_options, index=default_run_index)
+
+    filtered = results.copy()
+    timestamps = run_timestamp_series(filtered)
+    now = pd.Timestamp.now(tz="UTC")
+    if history_filter == "Today":
+        filtered = filtered[timestamps.dt.date == now.date()]
+    elif history_filter == "Last 7 days":
+        filtered = filtered[timestamps >= (now - pd.Timedelta(days=7))]
+    elif history_filter == "By run_id":
+        if selected_run_id == "All runs" and last_run_id:
+            selected_run_id = last_run_id
+        filtered = filtered[filtered["run_id"].map(clean_text) == selected_run_id] if selected_run_id != "All runs" else filtered
+
+    if selected_run_id != "All runs" and history_filter != "By run_id":
+        filtered = filtered[filtered["run_id"].map(clean_text) == selected_run_id]
+
+    if filtered.empty:
+        st.info("No saved jobs match the selected historical filter.")
+    else:
+        st.success(f"Loaded {len(filtered)} saved historical job result(s). No SerpAPI search was run.")
+    return filtered
+
+
 def main() -> None:
     st.set_page_config(page_title="U.S. Job Search", layout="wide")
     init_storage()
@@ -2407,6 +2662,8 @@ def main() -> None:
     job_titles = get_target_job_titles()
     targets = build_search_combinations(companies, job_titles)
     results = get_results()
+    search_runs = get_search_runs()
+    visible_results = render_history_overview(results, search_runs)
 
     upload_tab, search_tab, dashboard_tab, top_matches_tab, tracker_tab, settings_tab = st.tabs(
         ["Upload Targets", "Run Search", "Dashboard", "Top Matches", "Application Tracker", "Settings"]
@@ -2436,16 +2693,16 @@ def main() -> None:
         render_search_runs()
 
     with dashboard_tab:
-        render_dashboard(results, companies, job_titles)
+        render_dashboard(visible_results, companies, job_titles)
 
     with top_matches_tab:
-        render_top_matches(results)
+        render_top_matches(visible_results)
 
     with tracker_tab:
-        render_application_tracker(results)
+        render_application_tracker(visible_results)
 
     with settings_tab:
-        render_settings(results)
+        render_settings(visible_results)
 
 
 if __name__ == "__main__":
