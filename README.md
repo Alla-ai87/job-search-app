@@ -103,6 +103,28 @@ Use the historical controls to reopen old results:
 
 The `Load previous run` dropdown filters Dashboard, Top Matches, and Application Tracker to a saved run without running a new search. New searches append new run IDs and do not overwrite older results.
 
+## Emergency Local Recovery
+
+If the app previously ran in temporary local SQLite mode, open the `Emergency Local Recovery` panel at the top of the app.
+
+The recovery tool searches the app folder for:
+
+- `job_search.db`
+- any other `*.db` file
+
+If a local database still exists, click `Recover local data` to load:
+
+- companies
+- target job titles
+- job results
+- search runs
+- application tracker rows
+- notes
+
+The app shows recovered counts and provides `Export recovered data to Excel`. After Supabase is connected, use `Migrate recovered data to Supabase` to copy recovered local records into the persistent Supabase tables.
+
+If the local file was removed by Streamlit reboot, the app shows: `No recoverable local data found. Streamlit temporary storage was reset.`
+
 ## Excel Upload Format
 
 The uploaded spreadsheet should use the first two columns:

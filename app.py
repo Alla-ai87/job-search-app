@@ -138,6 +138,17 @@ REQUIRED_SUPABASE_TABLES = (
     "saved_profiles",
 )
 
+RECOVERY_TABLES = (
+    "companies",
+    "target_job_titles",
+    "job_results",
+    "search_runs",
+    "application_tracker",
+    "notes",
+    "saved_profiles",
+    "cv_profiles",
+)
+
 SUPABASE_SECRETS_EXAMPLE = """SERPAPI_API_KEY = "your_serpapi_key_here"
 SUPABASE_URL = "https://your-project-ref.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "your_supabase_service_role_key_here"
@@ -1805,6 +1816,109 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def tables_to_excel_bytes(tables: dict[str, pd.DataFrame]) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        wrote_sheet = False
+        for table_name, df in tables.items():
+            if df.empty:
+                continue
+            sheet_name = table_name[:31]
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            wrote_sheet = True
+        if not wrote_sheet:
+            pd.DataFrame({"message": ["No recovered data"]}).to_excel(writer, index=False, sheet_name="summary")
+    return output.getvalue()
+
+
+def find_local_sqlite_databases() -> list[Path]:
+    candidates = []
+    for path in APP_DIR.rglob("*.db"):
+        if path.is_file():
+            candidates.append(path)
+    return sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def sqlite_table_names(db_path: Path) -> set[str]:
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {row[0] for row in rows}
+
+
+def load_recoverable_sqlite_data(db_path: Path) -> dict[str, pd.DataFrame]:
+    available_tables = sqlite_table_names(db_path)
+    recovered = {}
+    try:
+        with sqlite3.connect(db_path) as conn:
+            for table_name in RECOVERY_TABLES:
+                if table_name in available_tables:
+                    recovered[table_name] = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+                else:
+                    recovered[table_name] = pd.DataFrame()
+    except sqlite3.Error:
+        return {table_name: pd.DataFrame() for table_name in RECOVERY_TABLES}
+    return recovered
+
+
+def recovered_counts(tables: dict[str, pd.DataFrame]) -> dict[str, int]:
+    return {
+        "companies": len(tables.get("companies", pd.DataFrame())),
+        "job_titles": len(tables.get("target_job_titles", pd.DataFrame())),
+        "jobs": len(tables.get("job_results", pd.DataFrame())),
+        "search_runs": len(tables.get("search_runs", pd.DataFrame())),
+        "application_tracker": len(tables.get("application_tracker", pd.DataFrame())),
+        "notes": len(tables.get("notes", pd.DataFrame())),
+    }
+
+
+def records_from_dataframe(df: pd.DataFrame) -> list[dict]:
+    if df.empty:
+        return []
+    prepared = df.where(pd.notna(df), None)
+    return prepared.to_dict(orient="records")
+
+
+def parse_json_column(records: list[dict], column_name: str) -> list[dict]:
+    for record in records:
+        value = record.get(column_name)
+        if isinstance(value, str) and value.strip():
+            try:
+                record[column_name] = json.loads(value)
+            except json.JSONDecodeError:
+                record[column_name] = value
+    return records
+
+
+def migrate_recovered_data_to_supabase(tables: dict[str, pd.DataFrame]) -> dict[str, int]:
+    migrated = {}
+    table_conflicts = {
+        "companies": "company",
+        "target_job_titles": "job_title",
+        "job_results": "result_key",
+        "search_runs": "run_id",
+        "application_tracker": "job_id",
+        "notes": "job_id",
+        "saved_profiles": "profile_name",
+        "cv_profiles": "profile_key",
+    }
+    for table_name, conflict_column in table_conflicts.items():
+        df = tables.get(table_name, pd.DataFrame())
+        records = records_from_dataframe(df)
+        if not records:
+            migrated[table_name] = 0
+            continue
+        if table_name == "job_results":
+            records = parse_json_column(records, "raw_json")
+        if table_name == "saved_profiles":
+            records = parse_json_column(records, "settings_json")
+        supabase_upsert(table_name, records, conflict_column)
+        migrated[table_name] = len(records)
+    return migrated
+
+
 BASE_EXPORT_COLUMNS = [
     "id",
     "company",
@@ -2689,6 +2803,69 @@ def render_settings(results: pd.DataFrame) -> None:
         st.caption(f"Current CV text loaded: {len(st.session_state['cv_text']):,} characters.")
 
 
+def render_local_recovery_section() -> None:
+    with st.expander("Emergency Local Recovery", expanded=False):
+        st.caption("Checks this app folder for `job_search.db` or other local SQLite `.db` files. No SerpAPI calls are made.")
+        db_files = find_local_sqlite_databases()
+        if not db_files:
+            st.warning("No recoverable local data found. Streamlit temporary storage was reset.")
+            return
+
+        db_options = {str(path): path for path in db_files}
+        selected_db_label = st.selectbox(
+            "Local SQLite database file",
+            options=list(db_options.keys()),
+            format_func=lambda value: f"{Path(value).name} - {db_options[value].stat().st_size:,} bytes",
+        )
+        selected_db = db_options[selected_db_label]
+
+        if st.button("Recover local data"):
+            recovered = load_recoverable_sqlite_data(selected_db)
+            st.session_state["recovered_local_data"] = recovered
+            st.session_state["recovered_local_db"] = str(selected_db)
+
+        recovered = st.session_state.get("recovered_local_data")
+        if not recovered:
+            return
+
+        counts = recovered_counts(recovered)
+        count_cols = st.columns(4)
+        count_cols[0].metric("companies recovered", counts["companies"])
+        count_cols[1].metric("job titles recovered", counts["job_titles"])
+        count_cols[2].metric("jobs recovered", counts["jobs"])
+        count_cols[3].metric("search runs recovered", counts["search_runs"])
+        extra_cols = st.columns(2)
+        extra_cols[0].metric("tracker rows recovered", counts["application_tracker"])
+        extra_cols[1].metric("notes recovered", counts["notes"])
+
+        if counts["companies"] == 0 and counts["job_titles"] == 0 and counts["jobs"] == 0 and counts["search_runs"] == 0:
+            st.warning("No recoverable local data found. Streamlit temporary storage was reset.")
+            return
+
+        st.download_button(
+            "Export recovered data to Excel",
+            data=tables_to_excel_bytes(recovered),
+            file_name=f"recovered_local_job_search_{datetime.now().date().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        st.markdown("#### Prepare migration to Supabase")
+        if not is_supabase_connected():
+            st.info("Connect Supabase first, then reopen this recovery panel and click `Migrate recovered data to Supabase`.")
+            return
+        if st.button("Migrate recovered data to Supabase"):
+            try:
+                migrated = migrate_recovered_data_to_supabase(recovered)
+            except requests.RequestException as exc:
+                st.error(f"Supabase migration failed: {exc}")
+                return
+            st.success(
+                "Migrated recovered data to Supabase: "
+                + ", ".join(f"{table}: {count}" for table, count in migrated.items())
+            )
+            st.rerun()
+
+
 def run_timestamp_series(results: pd.DataFrame) -> pd.Series:
     if results.empty:
         return pd.Series(dtype="datetime64[ns, UTC]")
@@ -2785,6 +2962,7 @@ def main() -> None:
     else:
         st.warning("Running in temporary local mode")
         render_supabase_setup_instructions(supabase_status)
+    render_local_recovery_section()
 
     if "cv_text" not in st.session_state or not clean_text(st.session_state.get("cv_text")):
         saved_cv_text, _ = get_cv_profile()
