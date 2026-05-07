@@ -37,7 +37,7 @@ SUPABASE_URL = "https://your-project-ref.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "your_supabase_service_role_key_here"
 ```
 
-7. Save secrets and deploy the app.
+7. Save secrets and reboot the app.
 
 ## Supabase Setup
 
@@ -53,14 +53,25 @@ SUPABASE_SERVICE_ROLE_KEY = "your_supabase_service_role_key_here"
 
 The service role key must stay server-side only. The app reads it from `st.secrets` and uses it only in backend requests from Streamlit.
 
+Required tables in `supabase_schema.sql`:
+
+- `companies`
+- `target_job_titles`
+- `job_results`
+- `search_runs`
+- `application_tracker`
+- `notes`
+- `saved_profiles`
+- `cv_profiles`
+
 ## Storage Modes
 
 The app shows one of these messages at startup:
 
-- `Storage mode: Supabase`
-- `Storage mode: temporary local SQLite`
+- `Connected to Supabase`
+- `Running in temporary local mode`
 
-When Supabase secrets are present, the app stores and loads data from Supabase:
+When Supabase secrets are present and all required tables are accessible, the app stores and loads data from Supabase:
 
 - companies
 - target job titles
@@ -68,8 +79,9 @@ When Supabase secrets are present, the app stores and loads data from Supabase:
 - search runs
 - application status, applied date, and notes
 - CV text/profile data
+- saved search profiles
 
-When Supabase secrets are missing, the app falls back to `job_search.db` next to `app.py`. This is useful for local testing, but Streamlit Cloud can rebuild local storage, so Supabase is recommended for permanent history.
+When Supabase secrets or tables are missing, the app falls back to `job_search.db` next to `app.py` and shows exact setup instructions. This is useful for local testing, but Streamlit Cloud can rebuild local storage, so Supabase is required for permanent history.
 
 ## Historical Results
 
