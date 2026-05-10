@@ -163,12 +163,14 @@ The `Run Search` tab includes an `API Usage / Quota` section. The app checks Ser
 
 Quota is checked only when you click `Check SerpAPI quota` or `Run Job Search`, so opening historical results does not consume SerpAPI calls.
 
-Safe mode is enabled by default and uses conservative limits:
+Full Search is enabled by default:
 
-- max companies per run: 2
-- max job titles per run: 2
-- max query variations per company/title: 2
-- max results per company/title: 5
+- max companies per run: all available companies
+- max job titles per run: all available job titles
+- max query variations per company/title: 4
+- max results per company/title: 20
+
+Safe Mode remains available as an optional fallback, but the app never switches to it automatically.
 
 The app estimates API calls before running:
 
@@ -180,15 +182,15 @@ If the estimated calls exceed remaining SerpAPI quota, the run button is blocked
 
 ## Search Profiles
 
-The `Run Search` tab includes three search profiles:
+The `Run Search` tab includes three search profiles. `Full Search` is the default on app load.
 
-- `Safe Mode`: conservative defaults for low API usage.
+- `Full Search`: all available companies, all available job titles, 4 query variations per company/title, and 20 results per company/title.
 - `Balanced Mode`: moderate coverage.
-- `Full / Maximum Mode`: all companies, all job titles, all query variations, and max results per company/title unless you saved a custom Full Search profile.
+- `Safe Mode`: conservative fallback for low API usage.
 
-Use `Save current settings as Full Search` to persist the current controls as your Full Search profile. Use `Load Full Search settings` to reload it later. Loading a profile does not run a search.
+Use `Save current settings as Full Search` to persist the current controls as your Full Search profile. Use `Load Full Search settings` to reload it later. Use `Restore My Full Search Defaults` to return to all companies, all job titles, 4 query variations, and 20 results per company/title. Loading or restoring a profile does not run a search.
 
-Full Search is intended for after API quota renews. The app still checks SerpAPI quota before running and blocks the run when estimated API calls exceed remaining quota.
+The app displays estimated API calls before running. If quota is low, it shows a warning but never silently switches to Safe Mode or reduces search scope. The app still checks SerpAPI quota before running and blocks the run when estimated API calls exceed remaining quota.
 
 ## Job Relevance Filtering
 

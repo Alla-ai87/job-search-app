@@ -1,6 +1,7 @@
 import hashlib
 from io import BytesIO
 import json
+import os
 import re
 import smtplib
 import sqlite3
@@ -177,6 +178,20 @@ def is_supabase_connected() -> bool:
     return bool(st.session_state.get("supabase_connected", False))
 
 
+def is_streamlit_cloud_environment() -> bool:
+    cwd = Path.cwd().as_posix()
+    return (
+        cwd.startswith("/mount/src")
+        or os.environ.get("STREAMLIT_CLOUD", "").lower() == "true"
+        or os.environ.get("STREAMLIT_SHARING_MODE", "") != ""
+        or os.environ.get("HOME", "") == "/home/adminuser"
+    )
+
+
+def is_local_sqlite_allowed() -> bool:
+    return not is_streamlit_cloud_environment()
+
+
 def supabase_headers(prefer: str = "") -> dict[str, str]:
     _, key = get_supabase_credentials()
     headers = {
@@ -273,6 +288,10 @@ def render_supabase_setup_instructions(status: dict) -> None:
         """
     )
     st.code(SUPABASE_SECRETS_EXAMPLE, language="toml")
+    try:
+        st.code((APP_DIR / "supabase_schema.sql").read_text(encoding="utf-8"), language="sql")
+    except OSError:
+        st.caption("The `supabase_schema.sql` file should be committed with the app repository.")
     st.info("Historical runs remain permanent only after the app shows `Connected to Supabase`.")
 
 
@@ -481,7 +500,7 @@ def init_db() -> None:
 
 
 def init_storage() -> None:
-    if not is_supabase_connected():
+    if not is_supabase_connected() and is_local_sqlite_allowed():
         init_db()
 
 
@@ -2208,6 +2227,18 @@ def clamp_int(value: object, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+SEARCH_PROFILE_OPTIONS = ["Full Search", "Balanced Mode", "Safe Mode"]
+
+
+def full_search_default_settings(company_count: int, job_title_count: int, max_query_variations: int) -> dict[str, int]:
+    return {
+        "max_companies_per_run": max(1, company_count),
+        "max_job_titles_per_run": max(1, job_title_count),
+        "max_query_variations": min(4, max_query_variations),
+        "max_jobs_per_target": 20,
+    }
+
+
 def search_profile_defaults(profile_name: str, company_count: int, job_title_count: int, max_query_variations: int) -> dict[str, int]:
     if profile_name == "Balanced Mode":
         return {
@@ -2216,16 +2247,11 @@ def search_profile_defaults(profile_name: str, company_count: int, job_title_cou
             "max_query_variations": min(4, max_query_variations),
             "max_jobs_per_target": 10,
         }
-    if profile_name == "Full / Maximum Mode":
+    if profile_name in {"Full Search", "Full / Maximum Mode"}:
         saved_settings = get_search_profile("Full Search")
         if saved_settings:
             return saved_settings
-        return {
-            "max_companies_per_run": max(1, company_count),
-            "max_job_titles_per_run": max(1, job_title_count),
-            "max_query_variations": max_query_variations,
-            "max_jobs_per_target": 20,
-        }
+        return full_search_default_settings(company_count, job_title_count, max_query_variations)
     return {
         "max_companies_per_run": min(2, max(1, company_count)),
         "max_job_titles_per_run": min(2, max(1, job_title_count)),
@@ -2287,13 +2313,31 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
             max_query_variation_count,
         )
         st.session_state["active_search_profile"] = pending_profile
+    if st.session_state.pop("pending_restore_full_search_defaults", False):
+        defaults = full_search_default_settings(company_count, job_title_count, max_query_variation_count)
+        apply_search_settings(defaults, company_count, job_title_count, max_query_variation_count)
+        save_search_profile("Full Search", defaults)
+        st.session_state["active_search_profile"] = "Full Search"
+        st.session_state["safe_mode_checkbox"] = False
+
+    if "active_search_profile" not in st.session_state:
+        st.session_state["active_search_profile"] = "Full Search"
+        apply_search_settings(
+            search_profile_defaults("Full Search", company_count, job_title_count, max_query_variation_count),
+            company_count,
+            job_title_count,
+            max_query_variation_count,
+        )
+
+    active_profile = st.session_state.get("active_search_profile", "Full Search")
+    if active_profile not in SEARCH_PROFILE_OPTIONS:
+        active_profile = "Full Search"
+        st.session_state["active_search_profile"] = active_profile
 
     selected_profile = st.selectbox(
         "Search profile",
-        options=["Safe Mode", "Balanced Mode", "Full / Maximum Mode"],
-        index=["Safe Mode", "Balanced Mode", "Full / Maximum Mode"].index(
-            st.session_state.get("active_search_profile", "Safe Mode")
-        ),
+        options=SEARCH_PROFILE_OPTIONS,
+        index=SEARCH_PROFILE_OPTIONS.index(active_profile),
     )
     if st.session_state.get("active_search_profile") != selected_profile:
         apply_search_settings(
@@ -2304,17 +2348,15 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
         )
         st.session_state["active_search_profile"] = selected_profile
 
-    safe_mode = st.checkbox("Safe mode - reduce API usage", value=selected_profile == "Safe Mode")
-    if safe_mode and selected_profile != "Safe Mode" and st.session_state.get("safe_mode_forced_profile") != selected_profile:
-        apply_search_settings(
-            search_profile_defaults("Safe Mode", company_count, job_title_count, max_query_variation_count),
-            company_count,
-            job_title_count,
-            max_query_variation_count,
-        )
-        st.session_state["safe_mode_forced_profile"] = selected_profile
+    safe_mode = st.checkbox(
+        "Safe mode - reduce API usage",
+        value=selected_profile == "Safe Mode",
+        key="safe_mode_checkbox",
+    )
+    if safe_mode and selected_profile != "Safe Mode":
+        st.info("Safe Mode is available as an optional fallback. Select `Safe Mode` from Search profile to apply it.")
 
-    st.caption("Use Full Search only after API quota renews.")
+    st.caption("Full Search is the default. Quota warnings will not reduce search scope automatically.")
 
     control_cols = st.columns(4)
     max_companies_per_run = control_cols[0].number_input(
@@ -2350,8 +2392,12 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
         save_search_profile("Full Search", current_search_settings())
         st.success("Saved current settings as Full Search.")
     if profile_cols[1].button("Load Full Search settings"):
-        st.session_state["pending_search_profile"] = "Full / Maximum Mode"
+        st.session_state["pending_search_profile"] = "Full Search"
         st.success("Loaded Full Search settings. Search was not run.")
+        st.rerun()
+    if st.button("Restore My Full Search Defaults"):
+        st.session_state["pending_restore_full_search_defaults"] = True
+        st.success("Restored and saved Full Search defaults.")
         st.rerun()
 
     selected_companies = companies.head(int(max_companies_per_run)) if companies is not None else pd.DataFrame()
@@ -2963,6 +3009,8 @@ def main() -> None:
         st.warning("Running in temporary local mode")
         render_supabase_setup_instructions(supabase_status)
     render_local_recovery_section()
+    if not is_supabase_connected() and not is_local_sqlite_allowed():
+        st.stop()
 
     if "cv_text" not in st.session_state or not clean_text(st.session_state.get("cv_text")):
         saved_cv_text, _ = get_cv_profile()
