@@ -135,6 +135,15 @@ The uploaded spreadsheet should use the first two columns:
 
 The app removes blanks, skips header values like `Company` and `Job title`, deduplicates values, saves companies and job titles separately, and searches every company against every target title.
 
+Upload mode defaults to `Replace existing targets`:
+
+- `Replace existing targets` clears only the saved company and job-title target lists, then imports the unique companies from Column A and unique job titles from Column B.
+- `Append to existing targets` keeps existing target lists and adds any new unique companies or job titles from the upload.
+
+Neither mode deletes historical job results, saved search runs, application tracker data, or notes. After upload, the app shows companies imported, job titles imported, and total search combinations. Full Search settings are refreshed from the current saved target counts.
+
+Use `Clear all targets` with confirmation to empty only the company and job-title target lists.
+
 ## Search Coverage
 
 For each company/title pair, the app runs these SerpAPI Google Jobs query variations:

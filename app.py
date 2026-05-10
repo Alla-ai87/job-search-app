@@ -535,8 +535,22 @@ def load_targets_from_excel(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame({"company": companies}), pd.DataFrame({"job_title": job_titles})
 
 
-def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame) -> tuple[int, int]:
+def clear_targets() -> None:
+    if is_supabase_connected():
+        supabase_request("DELETE", "companies", params={"company": "neq.__never_match_empty_delete__"}, prefer="return=minimal")
+        supabase_request("DELETE", "target_job_titles", params={"job_title": "neq.__never_match_empty_delete__"}, prefer="return=minimal")
+        return
+
+    with get_connection() as conn:
+        conn.execute("DELETE FROM companies")
+        conn.execute("DELETE FROM target_job_titles")
+
+
+def save_targets(companies_df: pd.DataFrame, job_titles_df: pd.DataFrame, replace_existing: bool = False) -> tuple[int, int]:
     created_at = utc_now()
+    if replace_existing:
+        clear_targets()
+
     if is_supabase_connected():
         company_rows = [
             {"company": clean_text(row.company), "created_at": created_at}
@@ -2175,6 +2189,42 @@ def top_matches_column_config() -> dict:
 
 def render_upload_section() -> None:
     st.subheader("Upload targets")
+    updated_message = st.session_state.pop("targets_updated_message", None)
+    if updated_message:
+        st.success(
+            f"{updated_message['mode']}: {updated_message['companies']} companies, "
+            f"{updated_message['job_titles']} job titles, "
+            f"{updated_message['combinations']} total search combinations."
+        )
+
+    existing_companies = get_companies()
+    existing_job_titles = get_target_job_titles()
+    st.caption(
+        f"Current saved targets: {len(existing_companies)} companies, "
+        f"{len(existing_job_titles)} job titles, "
+        f"{len(existing_companies) * len(existing_job_titles)} combinations."
+    )
+
+    with st.expander("Clear all targets"):
+        st.warning("This clears only company and job-title target lists. Historical job results and tracker data are not deleted.")
+        confirm_clear = st.checkbox("I understand this clears all saved targets", key="confirm_clear_targets")
+        if st.button("Clear all targets", disabled=not confirm_clear):
+            clear_targets()
+            reset_search_settings_after_target_change(0, 0)
+            st.session_state["targets_updated_message"] = {
+                "mode": "Cleared targets",
+                "companies": 0,
+                "job_titles": 0,
+                "combinations": 0,
+            }
+            st.rerun()
+
+    upload_mode = st.radio(
+        "Upload mode",
+        options=["Replace existing targets", "Append to existing targets"],
+        index=0,
+        horizontal=True,
+    )
     uploaded_file = st.file_uploader(
         "Excel file with companies in Column A and target job titles in Column B",
         type=["xlsx"],
@@ -2200,22 +2250,22 @@ def render_upload_section() -> None:
     with preview_cols[1]:
         st.metric("Job titles found", len(job_titles_df))
         st.dataframe(job_titles_df, use_container_width=True, hide_index=True)
-    st.metric("Search combinations", len(companies_df) * len(job_titles_df))
+    st.metric("Total search combinations", len(companies_df) * len(job_titles_df))
     if len(companies_df) <= 3:
         st.warning("Please verify Column A contains the full company list.")
 
     if st.button("Save Uploaded Targets", type="primary"):
-        inserted_companies, inserted_job_titles = save_targets(companies_df, job_titles_df)
-        if is_supabase_connected():
-            st.success(
-                f"Saved/updated {inserted_companies} companies and {inserted_job_titles} job titles in Supabase. "
-                "Existing duplicates were kept as one saved value."
-            )
-        else:
-            st.success(
-                f"Saved {inserted_companies} new companies and {inserted_job_titles} new job titles. "
-                "Existing duplicates were skipped."
-            )
+        replace_existing = upload_mode == "Replace existing targets"
+        inserted_companies, inserted_job_titles = save_targets(companies_df, job_titles_df, replace_existing=replace_existing)
+        current_companies = get_companies()
+        current_job_titles = get_target_job_titles()
+        reset_search_settings_after_target_change(len(current_companies), len(current_job_titles))
+        st.session_state["targets_updated_message"] = {
+            "mode": upload_mode,
+            "companies": len(current_companies),
+            "job_titles": len(current_job_titles),
+            "combinations": len(current_companies) * len(current_job_titles),
+        }
         st.rerun()
 
 
@@ -2237,6 +2287,16 @@ def full_search_default_settings(company_count: int, job_title_count: int, max_q
         "max_query_variations": min(4, max_query_variations),
         "max_jobs_per_target": 20,
     }
+
+
+def reset_search_settings_after_target_change(company_count: int, job_title_count: int) -> None:
+    max_query_variations = len(make_job_search_queries("Company", "Job Title"))
+    defaults = full_search_default_settings(company_count, job_title_count, max_query_variations)
+    apply_search_settings(defaults, company_count, job_title_count, max_query_variations)
+    st.session_state["active_search_profile"] = "Full Search"
+    st.session_state["safe_mode_checkbox"] = False
+    if is_supabase_connected():
+        save_search_profile("Full Search", defaults)
 
 
 def search_profile_defaults(profile_name: str, company_count: int, job_title_count: int, max_query_variations: int) -> dict[str, int]:
