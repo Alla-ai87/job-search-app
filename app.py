@@ -929,7 +929,7 @@ def get_cv_profile() -> tuple[str, str]:
     return clean_text(row["cv_text"]), clean_text(row["cv_summary"])
 
 
-def save_search_profile(profile_name: str, settings: dict[str, int]) -> None:
+def save_search_profile(profile_name: str, settings: dict) -> None:
     updated_at = utc_now()
     payload = json.dumps(settings)
     if is_supabase_connected():
@@ -959,7 +959,7 @@ def save_search_profile(profile_name: str, settings: dict[str, int]) -> None:
         )
 
 
-def get_search_profile(profile_name: str) -> dict[str, int]:
+def get_search_profile(profile_name: str) -> dict:
     if is_supabase_connected():
         rows = supabase_request(
             "GET",
@@ -2336,6 +2336,45 @@ def current_search_settings() -> dict[str, int]:
     }
 
 
+def valid_saved_values(values: object, options: list[str]) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    option_set = set(options)
+    return [clean_text(value) for value in values if clean_text(value) in option_set]
+
+
+def apply_pending_target_selection(company_options: list[str], job_title_options: list[str]) -> None:
+    pending_selection = st.session_state.pop("pending_target_selection", None)
+    if not pending_selection:
+        return
+    if "companies" in pending_selection:
+        st.session_state["selected_companies_filter"] = valid_saved_values(pending_selection["companies"], company_options)
+    if "job_titles" in pending_selection:
+        st.session_state["selected_job_titles_filter"] = valid_saved_values(pending_selection["job_titles"], job_title_options)
+
+
+def initialize_target_selection(company_options: list[str], job_title_options: list[str]) -> None:
+    apply_pending_target_selection(company_options, job_title_options)
+    if "selected_companies_filter" not in st.session_state or "selected_job_titles_filter" not in st.session_state:
+        saved_selection = get_search_profile("Last Search Selection")
+        st.session_state.setdefault(
+            "selected_companies_filter",
+            valid_saved_values(saved_selection.get("companies"), company_options),
+        )
+        st.session_state.setdefault(
+            "selected_job_titles_filter",
+            valid_saved_values(saved_selection.get("job_titles"), job_title_options),
+        )
+
+
+def save_last_target_selection(companies_selected: list[str], job_titles_selected: list[str]) -> None:
+    payload = {"companies": companies_selected, "job_titles": job_titles_selected}
+    if st.session_state.get("last_saved_target_selection") == payload:
+        return
+    save_search_profile("Last Search Selection", payload)
+    st.session_state["last_saved_target_selection"] = payload
+
+
 def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
     st.subheader("Run search")
     api_key = get_serpapi_key()
@@ -2460,8 +2499,64 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
         st.success("Restored and saved Full Search defaults.")
         st.rerun()
 
-    selected_companies = companies.head(int(max_companies_per_run)) if companies is not None else pd.DataFrame()
-    selected_job_titles = job_titles.head(int(max_job_titles_per_run)) if job_titles is not None else pd.DataFrame()
+    company_options = companies["company"].map(clean_text).drop_duplicates().tolist() if companies is not None and "company" in companies.columns else []
+    job_title_options = job_titles["job_title"].map(clean_text).drop_duplicates().tolist() if job_titles is not None and "job_title" in job_titles.columns else []
+    initialize_target_selection(company_options, job_title_options)
+
+    st.markdown("### Manual search selection")
+    st.caption("Nothing selected means search all companies and all job titles.")
+    selection_cols = st.columns(2)
+    with selection_cols[0]:
+        selected_company_values = st.multiselect(
+            "Companies",
+            options=company_options,
+            key="selected_companies_filter",
+        )
+    with selection_cols[1]:
+        selected_job_title_values = st.multiselect(
+            "Job Titles",
+            options=job_title_options,
+            key="selected_job_titles_filter",
+        )
+
+    quick_cols = st.columns(4)
+    if quick_cols[0].button("Select All"):
+        st.session_state["pending_target_selection"] = {
+            "companies": company_options,
+            "job_titles": job_title_options,
+        }
+        st.rerun()
+    if quick_cols[1].button("Clear All"):
+        st.session_state["pending_target_selection"] = {"companies": [], "job_titles": []}
+        st.rerun()
+    if quick_cols[2].button("Save Priority Companies"):
+        save_search_profile("Priority Companies", {"companies": selected_company_values})
+        st.success("Saved selected companies as Priority Companies.")
+    if quick_cols[3].button("Load Priority Companies"):
+        preset = get_search_profile("Priority Companies")
+        st.session_state["pending_target_selection"] = {"companies": preset.get("companies", [])}
+        st.rerun()
+
+    role_cols = st.columns(2)
+    if role_cols[0].button("Save Priority Roles"):
+        save_search_profile("Priority Roles", {"job_titles": selected_job_title_values})
+        st.success("Saved selected job titles as Priority Roles.")
+    if role_cols[1].button("Load Priority Roles"):
+        preset = get_search_profile("Priority Roles")
+        st.session_state["pending_target_selection"] = {"job_titles": preset.get("job_titles", [])}
+        st.rerun()
+
+    save_last_target_selection(selected_company_values, selected_job_title_values)
+
+    filtered_companies = companies
+    if selected_company_values:
+        filtered_companies = companies[companies["company"].map(clean_text).isin(selected_company_values)]
+    filtered_job_titles = job_titles
+    if selected_job_title_values:
+        filtered_job_titles = job_titles[job_titles["job_title"].map(clean_text).isin(selected_job_title_values)]
+
+    selected_companies = filtered_companies.head(int(max_companies_per_run)) if filtered_companies is not None else pd.DataFrame()
+    selected_job_titles = filtered_job_titles.head(int(max_job_titles_per_run)) if filtered_job_titles is not None else pd.DataFrame()
     selected_targets = build_search_combinations(selected_companies, selected_job_titles)
     active_target_count = len(selected_targets)
     estimated_api_calls = active_target_count * int(max_query_variations)

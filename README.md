@@ -201,6 +201,23 @@ Use `Save current settings as Full Search` to persist the current controls as yo
 
 The app displays estimated API calls before running. If quota is low, it shows a warning but never silently switches to Safe Mode or reduces search scope. The app still checks SerpAPI quota before running and blocks the run when estimated API calls exceed remaining quota.
 
+## Manual Search Selection
+
+Before running a search, use `Multi-select Companies` and `Multi-select Job Titles` in the `Run Search` tab.
+
+- Nothing selected means search all saved companies or all saved job titles.
+- Selecting companies searches only those companies.
+- Selecting job titles searches only those titles.
+
+The app updates these counters live:
+
+- companies this run
+- job titles this run
+- company/title combinations
+- estimated API calls
+
+Selections are saved in `saved_profiles` as `Last Search Selection`. Use `Save Priority Companies` / `Load Priority Companies` and `Save Priority Roles` / `Load Priority Roles` for reusable presets. `Select All` and `Clear All` provide quick selection controls.
+
 ## Job Relevance Filtering
 
 New searches save jobs with `relevance_score >= 1`. Strong controls, contracts, PMO, planning, scheduler, and risk matches score highest. Broader infrastructure management titles are allowed when paired with construction, rail, transit, metro, infrastructure, water, wastewater, aviation, airport, highway, bridge, tunnel, or design-build context.
