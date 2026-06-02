@@ -1836,17 +1836,19 @@ def top_best_matches(df: pd.DataFrame, limit: int = 10) -> pd.DataFrame:
     ranked = df.copy()
     ranked["_salary_sort"] = ranked["salary"].map(parse_salary_value)
     if "cv_match_score" not in ranked.columns:
-        ranked["cv_match_score"] = 0
+        ranked["cv_match_score"] = pd.NA
+    ranked["_cv_match_sort"] = cv_match_numeric_series(ranked).fillna(0)
+    ranked["_relevance_sort"] = pd.to_numeric(ranked.get("relevance_score", 0), errors="coerce").fillna(0)
     ranked["_recency_sort"] = ranked.apply(
         lambda row: parse_recency_score(row.get("posted_at"), row.get("created_at")),
         axis=1,
     )
     ranked = ranked.sort_values(
-        by=["cv_match_score", "relevance_score", "_salary_sort", "_recency_sort"],
+        by=["_cv_match_sort", "_relevance_sort", "_salary_sort", "_recency_sort"],
         ascending=[False, False, False, False],
         na_position="last",
     )
-    return ranked.head(limit).drop(columns=["_salary_sort", "_recency_sort"], errors="ignore")
+    return ranked.head(limit).drop(columns=["_cv_match_sort", "_relevance_sort", "_salary_sort", "_recency_sort"], errors="ignore")
 
 
 def deduplicate_top_matches(df: pd.DataFrame) -> pd.DataFrame:
@@ -2030,7 +2032,7 @@ def export_results_to_excel_bytes(
     include_search_metadata: bool = False,
     include_technical_details: bool = False,
 ) -> bytes:
-    export_df = ensure_job_ids(df)
+    export_df = prepare_cv_match_display(ensure_job_ids(df))
     export_columns = BASE_EXPORT_COLUMNS.copy()
     if include_search_metadata:
         export_columns.insert(2, "searched_job_title")
@@ -2040,7 +2042,10 @@ def export_results_to_excel_bytes(
     for column in export_columns:
         if column not in export_df.columns:
             export_df[column] = ""
+    if "CV Match %" in export_df.columns:
+        export_df["cv_match_score"] = export_df["CV Match %"]
     export_df = export_df[export_columns].rename(columns={"id": "Job ID"})
+    export_df = export_df.rename(columns={"cv_match_score": "CV Match %"})
     return dataframe_to_excel_bytes(export_df)
 
 
@@ -2151,10 +2156,10 @@ def normalized_application_status(value: object) -> str:
 
 def cv_match_numeric_series(df: pd.DataFrame) -> pd.Series:
     if df.empty or "cv_match_score" not in df.columns:
-        return pd.Series([0] * len(df), index=df.index)
-    calculated = df.apply(is_cv_match_calculated, axis=1) if "cv_match_reason" in df.columns else pd.Series([False] * len(df), index=df.index)
+        return pd.Series([pd.NA] * len(df), index=df.index, dtype="Float64")
+    calculated = cv_match_calculated_mask(df)
     scores = pd.to_numeric(df["cv_match_score"], errors="coerce")
-    return scores.where(calculated)
+    return scores.where(calculated).astype("Float64")
 
 
 def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = False) -> pd.DataFrame:
@@ -2176,7 +2181,7 @@ def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = Fals
             "Posted": source.get("posted_at", ""),
             "Sponsorship Status": sponsorship,
             "Sponsorship Reason": source.get("sponsorship_reason", ""),
-            "CV Match %": source.get("cv_match_score", ""),
+            "CV Match %": source.get("CV Match %", ""),
             "Relevance Score": source.get("relevance_score", ""),
             "Apply Link": source.get("apply_link", ""),
             "Application Status": source.get("application_status", ""),
@@ -2191,19 +2196,43 @@ def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = Fals
 
 
 def is_cv_match_calculated(row: pd.Series) -> bool:
-    reason = clean_text(row.get("cv_match_reason"))
-    return bool(reason and reason != "No CV uploaded.")
+    reason = clean_text(row.get("cv_match_reason")).lower()
+    return bool(reason and reason not in {"no cv uploaded.", "not calculated"})
+
+
+def cv_match_calculated_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series([], index=df.index, dtype=bool)
+    if "cv_match_calculated" in df.columns:
+        raw = df["cv_match_calculated"]
+        if raw.dtype == bool:
+            return raw.fillna(False)
+        return raw.map(lambda value: clean_text(value).lower() in {"true", "1", "yes", "calculated"})
+    if "cv_match_reason" in df.columns:
+        return df.apply(is_cv_match_calculated, axis=1).fillna(False).astype(bool)
+    scores = pd.to_numeric(df.get("cv_match_score", pd.Series([pd.NA] * len(df), index=df.index)), errors="coerce")
+    return scores.notna()
+
+
+def cv_match_display_series(scores: pd.Series, calculated_mask: pd.Series) -> pd.Series:
+    numeric_scores = pd.to_numeric(scores, errors="coerce")
+    display = pd.Series([""] * len(numeric_scores), index=numeric_scores.index, dtype=object)
+    display.loc[calculated_mask & numeric_scores.notna()] = numeric_scores.loc[calculated_mask & numeric_scores.notna()].round(0).astype("Int64").astype(str)
+    display.loc[~calculated_mask] = "Not calculated"
+    return display
 
 
 def prepare_cv_match_display(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "cv_match_score" not in df.columns:
-        return df
     prepared = df.copy()
+    if "cv_match_score" not in prepared.columns:
+        prepared["cv_match_score"] = pd.NA
     if "cv_match_reason" not in prepared.columns:
         prepared["cv_match_reason"] = ""
-    calculated_mask = prepared.apply(is_cv_match_calculated, axis=1)
-    prepared.loc[~calculated_mask, "cv_match_score"] = ""
+    prepared["cv_match_score"] = pd.to_numeric(prepared["cv_match_score"], errors="coerce").astype("Float64")
+    calculated_mask = cv_match_calculated_mask(prepared)
+    prepared.loc[~calculated_mask, "cv_match_score"] = pd.NA
     prepared.loc[~calculated_mask, "cv_match_reason"] = "Not calculated"
+    prepared["CV Match %"] = cv_match_display_series(prepared["cv_match_score"], calculated_mask)
     return prepared
 
 
@@ -2226,10 +2255,10 @@ def highlight_cv_match_score(row: pd.Series) -> list[str]:
     styles = [""] * len(row)
     if "cv_match_score" not in row.index:
         return styles
-    try:
-        score = int(row.get("cv_match_score") or 0)
-    except (TypeError, ValueError):
-        score = 0
+    score_value = pd.to_numeric(pd.Series([row.get("cv_match_score")]), errors="coerce").iloc[0]
+    if pd.isna(score_value):
+        return styles
+    score = int(score_value)
     if score >= 80:
         color = "background-color: #bbf7d0; color: #166534; font-weight: 700"
     elif score >= 60:
