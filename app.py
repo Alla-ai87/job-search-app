@@ -24,25 +24,37 @@ SERPAPI_ACCOUNT_ENDPOINT = "https://serpapi.com/account.json"
 
 
 SPONSORSHIP_POSITIVE_PHRASES = (
-    "visa sponsorship",
-    "sponsorship available",
+    "visa sponsorship is available",
+    "sponsorship is available",
+    "will sponsor",
     "we sponsor",
-    "H1B",
-    "relocation support",
+    "employer sponsorship",
+    "h-1b sponsorship available",
+    "work visa sponsorship available",
 )
 
 SPONSORSHIP_AUTHORIZATION_PHRASES = (
-    "work authorization",
-    "authorized to work",
-    "work permit",
-    "employment authorization",
+    "must be authorized to work",
+    "must have work authorization",
+    "must be legally authorized to work",
 )
 
 SPONSORSHIP_NEGATIVE_PHRASES = (
     "no sponsorship",
+    "will not sponsor",
+    "does not sponsor",
     "not eligible for sponsorship",
-    "must be authorized to work",
+    "sponsorship is not available",
+    "without sponsorship",
+    "cannot sponsor",
     "no visa support",
+)
+
+SPONSORSHIP_NOT_AVAILABLE_PHRASES = (
+    *SPONSORSHIP_NEGATIVE_PHRASES,
+    "must be authorized to work",
+    "must have work authorization",
+    "must be legally authorized to work",
 )
 
 STRONG_RELEVANCE_TERMS = (
@@ -118,6 +130,7 @@ RESULT_COLUMNS = [
     "salary",
     "sponsorship_status",
     "sponsorship_reason",
+    "matched_sponsorship_phrase",
     "relevance_score",
     "relevance_reason",
     "cv_match_score",
@@ -407,6 +420,7 @@ def init_db() -> None:
                 apply_link TEXT,
                 sponsorship_status TEXT NOT NULL,
                 sponsorship_reason TEXT,
+                matched_sponsorship_phrase TEXT,
                 relevance_score INTEGER NOT NULL DEFAULT 0,
                 relevance_reason TEXT,
                 cv_match_score INTEGER NOT NULL DEFAULT 0,
@@ -429,6 +443,7 @@ def init_db() -> None:
         ensure_column(conn, "job_results", "merged_into_id", "INTEGER")
         ensure_column(conn, "job_results", "updated_at", "TEXT")
         ensure_column(conn, "job_results", "sponsorship_reason", "TEXT")
+        ensure_column(conn, "job_results", "matched_sponsorship_phrase", "TEXT")
         ensure_column(conn, "job_results", "relevance_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "job_results", "relevance_reason", "TEXT")
         ensure_column(conn, "job_results", "cv_match_score", "INTEGER NOT NULL DEFAULT 0")
@@ -766,44 +781,6 @@ def merge_tracking_data(results: pd.DataFrame) -> pd.DataFrame:
         if column not in merged.columns:
             merged[column] = default
 
-    if is_supabase_connected():
-        try:
-            tracker_rows = supabase_request(
-                "GET",
-                "application_tracker",
-                params={"select": "job_id,application_status,applied_date,application_notes,updated_at"},
-            )
-            notes_rows = supabase_request(
-                "GET",
-                "notes",
-                params={"select": "job_id,note_text,updated_at"},
-            )
-        except requests.RequestException:
-            tracker_rows = []
-            notes_rows = []
-    else:
-        with get_connection() as conn:
-            tracker_rows = [dict(row) for row in conn.execute("SELECT job_id, application_status, applied_date, application_notes, updated_at FROM application_tracker").fetchall()]
-            notes_rows = [dict(row) for row in conn.execute("SELECT job_id, note_text, updated_at FROM notes").fetchall()]
-
-    tracker_by_job_id = {clean_text(row.get("job_id")): row for row in tracker_rows if clean_text(row.get("job_id"))}
-    notes_by_job_id = {clean_text(row.get("job_id")): row for row in notes_rows if clean_text(row.get("job_id"))}
-
-    for index, row in merged.iterrows():
-        lookup_keys = [clean_text(row.get("id")), clean_text(row.get("job_fingerprint"))]
-        tracker = next((tracker_by_job_id[key] for key in lookup_keys if key in tracker_by_job_id), None)
-        note = next((notes_by_job_id[key] for key in lookup_keys if key in notes_by_job_id), None)
-        if tracker:
-            merged.at[index, "application_status"] = normalized_application_status(tracker.get("application_status"))
-            merged.at[index, "status"] = normalized_application_status(tracker.get("application_status"))
-            merged.at[index, "application_notes"] = clean_text(tracker.get("application_notes"))
-            merged.at[index, "notes"] = clean_text(tracker.get("application_notes"))
-            if clean_text(tracker.get("applied_date")):
-                merged.at[index, "applied_date"] = clean_text(tracker.get("applied_date"))
-        if note and clean_text(note.get("note_text")):
-            merged.at[index, "application_notes"] = clean_text(note.get("note_text"))
-            merged.at[index, "notes"] = clean_text(note.get("note_text"))
-
     merged["application_status"] = merged["application_status"].map(normalized_application_status)
     merged["application_notes"] = merged["application_notes"].fillna("").map(clean_text)
     if "status" in merged.columns:
@@ -815,6 +792,7 @@ def merge_tracking_data(results: pd.DataFrame) -> pd.DataFrame:
         use_legacy_notes = (merged["application_notes"] == "") & (legacy_notes != "")
         merged.loc[use_legacy_notes, "application_notes"] = legacy_notes.loc[use_legacy_notes]
     merged["notes"] = merged["application_notes"]
+    merged["status"] = merged["application_status"]
     return merged
 
 
@@ -855,6 +833,7 @@ def get_results() -> pd.DataFrame:
                 salary,
                 sponsorship_status,
                 sponsorship_reason,
+                matched_sponsorship_phrase,
                 relevance_score,
                 relevance_reason,
                 cv_match_score,
@@ -967,6 +946,113 @@ def recalculate_cv_matches_for_results(results: pd.DataFrame, cv_text: str) -> i
     return updated
 
 
+def update_job_sponsorship(job_id: object, sponsorship_status: str, sponsorship_reason: str, matched_phrase: str) -> bool:
+    job_id_text = clean_text(job_id)
+    try:
+        numeric_job_id = int(job_id_text)
+    except (TypeError, ValueError):
+        return False
+    if is_supabase_connected():
+        supabase_request(
+            "PATCH",
+            "job_results",
+            params={"id": f"eq.{numeric_job_id}"},
+            json_body={
+                "sponsorship_status": sponsorship_status,
+                "sponsorship_reason": sponsorship_reason,
+                "matched_sponsorship_phrase": matched_phrase,
+                "updated_at": utc_now(),
+            },
+            prefer="return=minimal",
+        )
+        return True
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE job_results
+            SET
+                sponsorship_status = ?,
+                sponsorship_reason = ?,
+                matched_sponsorship_phrase = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (sponsorship_status, sponsorship_reason, matched_phrase, utc_now(), numeric_job_id),
+        )
+    return True
+
+
+def recalculate_sponsorship_for_results(results: pd.DataFrame) -> int:
+    if results.empty:
+        return 0
+    updated = 0
+    for row in ensure_job_ids(results).itertuples(index=False):
+        job_id = getattr(row, "id", None)
+        application_text = " ".join(
+            [
+                clean_text(getattr(row, "apply_link", "")),
+                clean_text(getattr(row, "job_url", "")),
+            ]
+        )
+        status, reason, matched_phrase = detect_sponsorship_status(
+            clean_text(getattr(row, "title", "")),
+            clean_text(getattr(row, "description", "")),
+            application_text,
+        )
+        if update_job_sponsorship(job_id, status, reason, matched_phrase):
+            updated += 1
+    return updated
+
+
+def get_job_tracking_from_storage(job_id: object, job_fingerprint: str = "") -> dict:
+    job_id_text = clean_text(job_id)
+    fingerprint = clean_text(job_fingerprint)
+    try:
+        numeric_job_id = int(job_id_text)
+    except (TypeError, ValueError):
+        numeric_job_id = None
+
+    if is_supabase_connected():
+        params = {
+            "select": "id,job_fingerprint,application_status,notes,application_notes,applied_date",
+            "limit": 1,
+        }
+        if numeric_job_id is not None:
+            params["id"] = f"eq.{numeric_job_id}"
+        elif fingerprint:
+            params["job_fingerprint"] = f"eq.{fingerprint}"
+        else:
+            return {}
+        rows = supabase_request("GET", "job_results", params=params)
+        return rows[0] if rows else {}
+
+    with get_connection() as conn:
+        if numeric_job_id is not None:
+            row = conn.execute(
+                """
+                SELECT id, job_fingerprint, application_status, notes, application_notes, applied_date
+                FROM job_results
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (numeric_job_id,),
+            ).fetchone()
+        elif fingerprint:
+            row = conn.execute(
+                """
+                SELECT id, job_fingerprint, application_status, notes, application_notes, applied_date
+                FROM job_results
+                WHERE job_fingerprint = ? AND merged_into_id IS NULL
+                LIMIT 1
+                """,
+                (fingerprint,),
+            ).fetchone()
+        else:
+            row = None
+    return dict(row) if row else {}
+
+
 def save_search_run(
     run_id: str,
     run_started_at: str,
@@ -1030,6 +1116,13 @@ def update_job_tracking(
         numeric_job_id = int(job_id_text)
     except (TypeError, ValueError):
         numeric_job_id = None
+    before = get_job_tracking_from_storage(numeric_job_id if numeric_job_id is not None else job_id_text, fingerprint)
+    print(
+        "TRACKING BEFORE SAVE:",
+        "Job ID:", job_id_text,
+        "Old Status:", clean_text(before.get("application_status")),
+        "New Status:", application_status,
+    )
 
     if is_supabase_connected():
         updated_at = utc_now()
@@ -1044,7 +1137,6 @@ def update_job_tracking(
                 "application_status": application_status,
                 "application_notes": application_notes,
                 "applied_date": applied_date or None,
-                "status": application_status,
                 "notes": application_notes,
                 "updated_at": updated_at,
             },
@@ -1077,7 +1169,16 @@ def update_job_tracking(
             ],
             "job_id",
         )
-        return True
+        after = get_job_tracking_from_storage(numeric_job_id if numeric_job_id is not None else job_id_text, fingerprint)
+        print(
+            "TRACKING AFTER SAVE:",
+            "Job ID:", job_id_text,
+            "Database Status:", clean_text(after.get("application_status")),
+        )
+        return (
+            normalized_application_status(after.get("application_status")) == application_status
+            and clean_text(after.get("notes")) == application_notes
+        )
 
     if numeric_job_id is None and not fingerprint:
         return False
@@ -1091,12 +1192,11 @@ def update_job_tracking(
                     application_status = ?,
                     application_notes = ?,
                     applied_date = ?,
-                    status = ?,
                     notes = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (application_status, application_notes, applied_date, application_status, application_notes, updated_at, numeric_job_id),
+                (application_status, application_notes, applied_date, application_notes, updated_at, numeric_job_id),
             )
         else:
             conn.execute(
@@ -1106,12 +1206,11 @@ def update_job_tracking(
                     application_status = ?,
                     application_notes = ?,
                     applied_date = ?,
-                    status = ?,
                     notes = ?,
                     updated_at = ?
                 WHERE job_fingerprint = ? AND merged_into_id IS NULL
                 """,
-                (application_status, application_notes, applied_date, application_status, application_notes, updated_at, fingerprint),
+                (application_status, application_notes, applied_date, application_notes, updated_at, fingerprint),
             )
         tracker_job_id = str(numeric_job_id) if numeric_job_id is not None else fingerprint
         conn.execute(
@@ -1138,7 +1237,16 @@ def update_job_tracking(
             """,
             (tracker_job_id, numeric_job_id, application_notes, updated_at),
         )
-    return True
+    after = get_job_tracking_from_storage(numeric_job_id if numeric_job_id is not None else job_id_text, fingerprint)
+    print(
+        "TRACKING AFTER SAVE:",
+        "Job ID:", job_id_text,
+        "Database Status:", clean_text(after.get("application_status")),
+    )
+    return (
+        normalized_application_status(after.get("application_status")) == application_status
+        and clean_text(after.get("notes")) == application_notes
+    )
 
 
 def save_cv_profile(cv_text: str, cv_summary: str = "") -> None:
@@ -1324,18 +1432,20 @@ def collect_application_text(job: dict) -> str:
     return " ".join(part for part in parts if part)
 
 
-def detect_sponsorship_status(title: object, description: object, application_text: object = "") -> tuple[str, str]:
+def detect_sponsorship_status(title: object, description: object, application_text: object = "") -> tuple[str, str, str]:
     text = " ".join([clean_text(title), clean_text(description), clean_text(application_text)]).lower()
-    for phrase in SPONSORSHIP_POSITIVE_PHRASES:
+    for phrase in SPONSORSHIP_NOT_AVAILABLE_PHRASES:
         if phrase_in_text(text, phrase):
-            return "sponsorship available", phrase
-    for phrase in SPONSORSHIP_NEGATIVE_PHRASES:
-        if phrase_in_text(text, phrase):
-            return "sponsorship not available", phrase
+            if phrase in SPONSORSHIP_AUTHORIZATION_PHRASES:
+                return "requires work authorization", f"Requires work authorization: {phrase}", phrase
+            return "sponsorship not available", f"Negative phrase matched: {phrase}", phrase
     for phrase in SPONSORSHIP_AUTHORIZATION_PHRASES:
         if phrase_in_text(text, phrase):
-            return "requires work authorization", phrase
-    return "not mentioned", ""
+            return "requires work authorization", f"Requires work authorization: {phrase}", phrase
+    for phrase in SPONSORSHIP_POSITIVE_PHRASES:
+        if phrase_in_text(text, phrase):
+            return "sponsorship available", f"Explicit positive phrase matched: {phrase}", phrase
+    return "not mentioned", "No explicit sponsorship phrase found", ""
 
 
 def contains_term(text: str, term: str) -> bool:
@@ -1774,6 +1884,19 @@ def best_sponsorship_status(existing_status: object, new_status: object) -> str:
     return new if SPONSORSHIP_PRIORITY.get(new, 0) > SPONSORSHIP_PRIORITY.get(existing, 0) else existing
 
 
+def is_explicit_positive_sponsorship(status: object, matched_phrase: object) -> bool:
+    return normalize_sponsorship_status(status) == "sponsorship available" and clean_text(matched_phrase).lower() in SPONSORSHIP_POSITIVE_PHRASES
+
+
+def choose_sponsorship_update(existing: dict, new_status: str, new_reason: str, new_phrase: str) -> tuple[str, str, str]:
+    existing_status = normalize_sponsorship_status(existing.get("sponsorship_status"))
+    existing_reason = clean_text(existing.get("sponsorship_reason"))
+    existing_phrase = clean_text(existing.get("matched_sponsorship_phrase"))
+    if new_status == "not mentioned" and is_explicit_positive_sponsorship(existing_status, existing_phrase):
+        return existing_status, existing_reason, existing_phrase
+    return new_status, new_reason, new_phrase
+
+
 def best_posted_at(existing_posted_at: object, new_posted_at: object, existing_created_at: object = "", new_created_at: object = "") -> str:
     existing_text = clean_text(existing_posted_at)
     new_text = clean_text(new_posted_at)
@@ -1816,6 +1939,7 @@ def merge_job_record_values(records: list[dict]) -> dict:
         keeper["salary"] = best_non_empty(keeper.get("salary"), record.get("salary"))
         keeper["sponsorship_status"] = best_sponsorship_status(keeper.get("sponsorship_status"), record.get("sponsorship_status"))
         keeper["sponsorship_reason"] = best_non_empty(keeper.get("sponsorship_reason"), record.get("sponsorship_reason"))
+        keeper["matched_sponsorship_phrase"] = best_non_empty(keeper.get("matched_sponsorship_phrase"), record.get("matched_sponsorship_phrase"))
         keeper["first_seen_at"] = min(
             [value for value in [clean_text(keeper.get("first_seen_at")), clean_text(record.get("first_seen_at")), clean_text(keeper.get("created_at")), clean_text(record.get("created_at"))] if value]
         )
@@ -1882,6 +2006,7 @@ def migrate_sqlite_job_fingerprints(conn: sqlite3.Connection) -> None:
                 salary = ?,
                 sponsorship_status = ?,
                 sponsorship_reason = ?,
+                matched_sponsorship_phrase = ?,
                 first_seen_at = ?,
                 last_seen_at = ?
             WHERE id = ?
@@ -1899,6 +2024,7 @@ def migrate_sqlite_job_fingerprints(conn: sqlite3.Connection) -> None:
                 merged.get("salary"),
                 merged.get("sponsorship_status"),
                 merged.get("sponsorship_reason"),
+                merged.get("matched_sponsorship_phrase"),
                 merged.get("first_seen_at"),
                 merged.get("last_seen_at"),
                 keeper_id,
@@ -1972,6 +2098,7 @@ def migrate_supabase_job_fingerprints() -> None:
                 "salary": merged.get("salary"),
                 "sponsorship_status": merged.get("sponsorship_status"),
                 "sponsorship_reason": merged.get("sponsorship_reason"),
+                "matched_sponsorship_phrase": merged.get("matched_sponsorship_phrase"),
                 "first_seen_at": merged.get("first_seen_at"),
                 "last_seen_at": merged.get("last_seen_at"),
             },
@@ -2056,7 +2183,7 @@ def save_job_results_supabase(
         posted_at = clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at"))
         salary = get_salary(job)
         application_text = collect_application_text(job)
-        sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
+        sponsorship_status, sponsorship_reason, matched_sponsorship_phrase = detect_sponsorship_status(title, description, application_text)
         cv_match_score, cv_match_reason = calculate_cv_match(
             title,
             employer_name,
@@ -2079,13 +2206,21 @@ def save_job_results_supabase(
         )
         if existing_rows:
             existing = existing_rows[0]
+            updated_sponsorship, updated_sponsorship_reason, updated_sponsorship_phrase = choose_sponsorship_update(
+                existing,
+                sponsorship_status,
+                sponsorship_reason,
+                matched_sponsorship_phrase,
+            )
             update_payload = {
                 "run_id": run_id,
                 "run_started_at": run_started_at,
                 "last_seen_at": run_started_at,
                 "posted_at": best_posted_at(existing.get("posted_at"), posted_at, existing.get("created_at"), created_at),
                 "salary": clean_text(existing.get("salary")) or salary,
-                "sponsorship_status": best_sponsorship_status(existing.get("sponsorship_status"), sponsorship_status),
+                "sponsorship_status": updated_sponsorship,
+                "sponsorship_reason": updated_sponsorship_reason,
+                "matched_sponsorship_phrase": updated_sponsorship_phrase,
                 "relevance_score": max_numeric(existing.get("relevance_score"), relevance_score),
                 "cv_match_score": max_numeric(existing.get("cv_match_score"), cv_match_score),
                 "raw_json": job,
@@ -2094,8 +2229,6 @@ def save_job_results_supabase(
                 update_payload["relevance_reason"] = relevance_reason
             if int(update_payload["cv_match_score"]) > int(pd.to_numeric(pd.Series([existing.get("cv_match_score")]), errors="coerce").fillna(0).iloc[0]):
                 update_payload["cv_match_reason"] = cv_match_reason
-            if update_payload["sponsorship_status"] != normalize_sponsorship_status(existing.get("sponsorship_status")):
-                update_payload["sponsorship_reason"] = sponsorship_reason
             if not clean_text(existing.get("description")) and description:
                 update_payload["description"] = description
             supabase_request(
@@ -2132,11 +2265,11 @@ def save_job_results_supabase(
                 "apply_link": apply_link,
                 "sponsorship_status": sponsorship_status,
                 "sponsorship_reason": sponsorship_reason,
+                "matched_sponsorship_phrase": matched_sponsorship_phrase,
                 "relevance_score": int(relevance_score),
                 "relevance_reason": relevance_reason,
                 "cv_match_score": int(cv_match_score),
                 "cv_match_reason": cv_match_reason,
-                "status": "New",
                 "notes": "",
                 "application_status": "New",
                 "applied_date": None,
@@ -2199,7 +2332,7 @@ def save_job_results(
             posted_at = clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at"))
             salary = get_salary(job)
             application_text = collect_application_text(job)
-            sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
+            sponsorship_status, sponsorship_reason, matched_sponsorship_phrase = detect_sponsorship_status(title, description, application_text)
             cv_match_score, cv_match_reason = calculate_cv_match(
                 title,
                 employer_name,
@@ -2220,7 +2353,12 @@ def save_job_results(
                 existing_cv = max_numeric(existing_record.get("cv_match_score"))
                 updated_relevance = max_numeric(existing_relevance, relevance_score)
                 updated_cv = max_numeric(existing_cv, cv_match_score)
-                updated_sponsorship = best_sponsorship_status(existing_record.get("sponsorship_status"), sponsorship_status)
+                updated_sponsorship, updated_sponsorship_reason, updated_sponsorship_phrase = choose_sponsorship_update(
+                    existing_record,
+                    sponsorship_status,
+                    sponsorship_reason,
+                    matched_sponsorship_phrase,
+                )
                 conn.execute(
                     """
                     UPDATE job_results
@@ -2233,6 +2371,7 @@ def save_job_results(
                         description = ?,
                         sponsorship_status = ?,
                         sponsorship_reason = ?,
+                        matched_sponsorship_phrase = ?,
                         relevance_score = ?,
                         relevance_reason = ?,
                         cv_match_score = ?,
@@ -2248,7 +2387,8 @@ def save_job_results(
                         clean_text(existing_record.get("salary")) or salary,
                         clean_text(existing_record.get("description")) or description,
                         updated_sponsorship,
-                        sponsorship_reason if updated_sponsorship != normalize_sponsorship_status(existing_record.get("sponsorship_status")) else existing_record.get("sponsorship_reason"),
+                        updated_sponsorship_reason,
+                        updated_sponsorship_phrase,
                         updated_relevance,
                         relevance_reason if updated_relevance > existing_relevance else existing_record.get("relevance_reason"),
                         updated_cv,
@@ -2283,11 +2423,11 @@ def save_job_results(
                     apply_link,
                     sponsorship_status,
                     sponsorship_reason,
+                    matched_sponsorship_phrase,
                     relevance_score,
                     relevance_reason,
                     cv_match_score,
                     cv_match_reason,
-                    status,
                     notes,
                     application_status,
                     applied_date,
@@ -2318,11 +2458,11 @@ def save_job_results(
                     apply_link,
                     sponsorship_status,
                     sponsorship_reason,
+                    matched_sponsorship_phrase,
                     relevance_score,
                     relevance_reason,
                     cv_match_score,
                     cv_match_reason,
-                    "New",
                     "",
                     "New",
                     "",
@@ -2585,6 +2725,7 @@ BASE_EXPORT_COLUMNS = [
     "relevance_score",
     "apply_link",
     "sponsorship_reason",
+    "matched_sponsorship_phrase",
     "relevance_reason",
     "cv_match_reason",
     "application_status",
@@ -2732,7 +2873,7 @@ def cv_match_numeric_series(df: pd.DataFrame) -> pd.Series:
 
 def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = False) -> pd.DataFrame:
     source = prepare_cv_match_display(ensure_job_ids(df))
-    for column in ["application_status", "application_notes", "sponsorship_reason"]:
+    for column in ["application_status", "application_notes", "sponsorship_reason", "matched_sponsorship_phrase"]:
         if column not in source.columns:
             source[column] = ""
     source["application_status"] = source["application_status"].map(normalized_application_status)
@@ -2751,6 +2892,7 @@ def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = Fals
             "Last Seen": source.get("last_seen_at", ""),
             "Sponsorship Status": sponsorship,
             "Sponsorship Reason": source.get("sponsorship_reason", ""),
+            "Matched Sponsorship Phrase": source.get("matched_sponsorship_phrase", ""),
             "CV Match %": source.get("CV Match %", ""),
             "Relevance Score": source.get("relevance_score", ""),
             "Apply Link": source.get("apply_link", ""),
@@ -3486,6 +3628,7 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
     col3.metric("Sponsorship available", results["sponsorship_status"].map(is_sponsorship_available_status).sum())
 
     st.markdown("### Tracking Counts")
+    st.caption("Tracking source: job_results.application_status and job_results.notes")
     status_counts = working["application_status"].value_counts().to_dict()
     status_count_cols = st.columns(6)
     for index, status_name in enumerate(["New", "Interested", "Applied", "Interview", "Offer", "Rejected"]):
@@ -3608,6 +3751,7 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
             "Last Seen": st.column_config.TextColumn("Last Seen"),
             "Sponsorship Status": st.column_config.TextColumn("Sponsorship Status"),
             "Sponsorship Reason": st.column_config.TextColumn("Sponsorship Reason", width="medium"),
+            "Matched Sponsorship Phrase": st.column_config.TextColumn("Matched Sponsorship Phrase", width="medium"),
             "CV Match %": st.column_config.TextColumn("CV Match %"),
             "Relevance Score": st.column_config.NumberColumn("Relevance Score", format="%d"),
             "Apply Link": st.column_config.LinkColumn("Apply Link", display_text="Apply Now"),
@@ -3639,16 +3783,36 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
 
     if changed_rows:
         saved_any = False
+        debug_rows = []
         for job_id, edited_status, edited_notes in changed_rows:
-            saved_any = update_job_tracking(
+            before = get_job_tracking_from_storage(job_id, fingerprint_lookup.get(clean_text(job_id), ""))
+            old_status = normalized_application_status(before.get("application_status"))
+            saved = update_job_tracking(
                 job_id,
                 edited_status,
                 edited_notes,
                 job_fingerprint=fingerprint_lookup.get(clean_text(job_id), ""),
-            ) or saved_any
+            )
+            after = get_job_tracking_from_storage(job_id, fingerprint_lookup.get(clean_text(job_id), ""))
+            debug_rows.append(
+                {
+                    "Job ID": job_id,
+                    "Old Status": old_status,
+                    "New Status": edited_status,
+                    "Database Status After Save": normalized_application_status(after.get("application_status")),
+                    "Saved": "yes" if saved else "no",
+                }
+            )
+            saved_any = saved or saved_any
+        st.session_state["tracking_debug_rows"] = debug_rows
         if saved_any:
             st.session_state["tracking_updated_message"] = "Tracking updated"
         st.rerun()
+
+    tracking_debug_rows = st.session_state.pop("tracking_debug_rows", None)
+    if tracking_debug_rows:
+        with st.expander("Tracking save debug", expanded=True):
+            st.dataframe(pd.DataFrame(tracking_debug_rows), use_container_width=True, hide_index=True)
 
     include_search_metadata = st.checkbox(
         "Include search metadata",
@@ -3711,6 +3875,17 @@ def render_settings(results: pd.DataFrame) -> None:
             return
         updated_count = recalculate_cv_matches_for_results(all_results, active_cv_text)
         st.success(f"Recalculated CV match for {updated_count} saved job(s).")
+        st.rerun()
+
+    st.markdown("### Sponsorship Recalculation")
+    st.caption("Uses strict explicit sponsorship phrases and checks negative/work-authorization phrases first. No SerpAPI calls are made.")
+    if st.button("Recalculate Sponsorship for All Saved Jobs"):
+        all_results = get_results()
+        if all_results.empty:
+            st.info("No saved jobs found to recalculate.")
+            return
+        updated_count = recalculate_sponsorship_for_results(all_results)
+        st.success(f"Recalculated sponsorship for {updated_count} saved job(s).")
         st.rerun()
 
 
