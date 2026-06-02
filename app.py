@@ -184,6 +184,31 @@ def get_supabase_credentials() -> tuple[str, str]:
     return url, key
 
 
+def read_streamlit_secret(secret_name: str) -> str:
+    try:
+        return clean_text(st.secrets[secret_name])
+    except Exception:
+        return ""
+
+
+def mask_secret(value: str) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def mask_debug_text(text: object, secrets_to_mask: list[str]) -> str:
+    masked = clean_text(text)
+    for secret in secrets_to_mask:
+        secret_text = clean_text(secret)
+        if secret_text:
+            masked = masked.replace(secret_text, mask_secret(secret_text))
+    return masked
+
+
 def is_supabase_configured() -> bool:
     url, key = get_supabase_credentials()
     return bool(url and key)
@@ -261,6 +286,54 @@ def check_supabase_table(table_name: str) -> tuple[bool, str]:
     except requests.RequestException as exc:
         return False, str(exc)
     return True, ""
+
+
+def supabase_read_debug_exception(table_name: str, url: str, key: str) -> str:
+    if not url:
+        return "Not attempted: SUPABASE_URL is missing"
+    if not key:
+        return "Not attempted: SUPABASE_SERVICE_ROLE_KEY is missing"
+    try:
+        response = requests.get(
+            f"{url.rstrip('/')}/rest/v1/{table_name}",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+            },
+            params={"select": "*", "limit": 1},
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body = ""
+        if exc.response is not None:
+            body = exc.response.text
+        return mask_debug_text(f"{type(exc).__name__}: {exc}; response_body={body}", [key])
+    except Exception as exc:
+        return mask_debug_text(f"{type(exc).__name__}: {exc}", [key])
+    return "OK"
+
+
+def render_supabase_debug_section() -> None:
+    debug_url = read_streamlit_secret("SUPABASE_URL").rstrip("/")
+    debug_key = read_streamlit_secret("SUPABASE_SERVICE_ROLE_KEY")
+    project_host = ""
+    if debug_url:
+        try:
+            project_host = urlsplit(debug_url).netloc
+        except ValueError as exc:
+            project_host = f"Invalid URL: {exc}"
+
+    with st.expander("Supabase Debug", expanded=False):
+        st.write(f"SUPABASE_URL loaded: {bool(debug_url)}")
+        st.write(f"Project host from SUPABASE_URL: {project_host or 'Not available'}")
+        st.write(f"SERVICE_ROLE_KEY loaded: {bool(debug_key)}")
+        st.write("Masked service role key: " + (mask_secret(debug_key) if debug_key else "Not loaded"))
+        st.write("Exact exception when reading public.job_results:")
+        st.code(supabase_read_debug_exception("job_results", debug_url, debug_key), language="text")
+        st.write("Exact exception when reading public.companies:")
+        st.code(supabase_read_debug_exception("companies", debug_url, debug_key), language="text")
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -4050,6 +4123,7 @@ def main() -> None:
     else:
         st.warning("Running in temporary local mode")
         render_supabase_setup_instructions(supabase_status)
+    render_supabase_debug_section()
     render_local_recovery_section()
     if not is_supabase_connected() and not is_local_sqlite_allowed():
         st.stop()
