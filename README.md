@@ -10,7 +10,7 @@ Streamlit Cloud app for a U.S. infrastructure, construction, PMO, contracts, pro
 - Save deduplicated results with relevance score, sponsorship status, CV match score, tracker status, notes, and search-run history.
 - Review Top 20 best matches sorted by CV match score, relevance, salary, and recency.
 - Upload a PDF/DOCX CV for match scoring.
-- Update application status, applied date, and notes in the Application Tracker.
+- Update application status and notes directly in the unified Jobs Dashboard.
 - Export filtered results to Excel.
 - Use Supabase PostgreSQL for persistent production storage, with local SQLite fallback when Supabase secrets are missing.
 
@@ -101,7 +101,7 @@ Use the historical controls to reopen old results:
 - `All history`
 - `By run_id`
 
-The `Load previous run` dropdown filters Dashboard, Top Matches, and Application Tracker to a saved run without running a new search. New searches append new run IDs and do not overwrite older results.
+The `Load previous run` dropdown filters the Jobs Dashboard to a saved run without running a new search. New searches append new run IDs and do not overwrite older results.
 
 ## Emergency Local Recovery
 
@@ -230,6 +230,16 @@ For new searches, the app checks job title, description, and application text wh
 
 Positive phrases mark the job `sponsorship available`; negative phrases mark it `sponsorship not available`; authorization phrases mark it `requires work authorization`; otherwise it is `not mentioned`.
 
+The Jobs Dashboard includes a sponsorship status filter:
+
+- `All`
+- `sponsorship available`
+- `sponsorship not available`
+- `not mentioned`
+- `requires work authorization`
+
+`Show only possible sponsorship` includes `sponsorship available` and `not mentioned`. These filters use saved data only and do not rerun SerpAPI. Tables also show `sponsorship_reason` when available.
+
 ## CV Matching
 
 Upload a PDF or DOCX CV in `Settings`, then run a new search. New saved jobs receive:
@@ -237,15 +247,44 @@ Upload a PDF or DOCX CV in `Settings`, then run a new search. New saved jobs rec
 - `cv_match_score`, from 0 to 100.
 - `cv_match_reason`, showing matched senior infrastructure PMO, controls, contracts, planning, scheduling, risk, industry, and seniority terms.
 
-## Application Tracker
+Use `Recalculate CV Match for All Saved Jobs` in `Settings` after uploading/extracting a CV to update historical saved jobs in storage. Jobs that have not been calculated display `Not calculated` or blank rather than a misleading zero.
 
-Use the `Application Tracker` tab to update:
+## Jobs Dashboard
 
-- `application_status`: `New`, `Interested`, `Applied`, `Interview`, `Offer`, `Rejected`, or `Archived`
-- `applied_date`
-- `application_notes`
+The app uses one unified Jobs Dashboard. There is no separate Application Tracker page.
+
+The All Matching Jobs table includes:
+
+- Job ID
+- Company
+- Job Title
+- Employer
+- Location
+- Salary
+- Posted
+- Sponsorship Status
+- CV Match %
+- Relevance Score
+- Apply Link
+- Application Status
+- Notes
+
+Edit `Application Status` and `Notes` directly in the table, then click `Save Dashboard Updates`.
+
+Application status options are:
+
+- `New`
+- `Interested`
+- `Applied`
+- `Interview`
+- `Offer`
+- `Rejected`
+- `Closed`
+- `Archived`
 
 Updates are persisted in Supabase when configured, or SQLite fallback otherwise.
+
+Use `Show technical details` to temporarily show search/run metadata such as `searched_job_title`, `run_id`, and `run_started_at`. These fields are hidden by default.
 
 ## Export
 

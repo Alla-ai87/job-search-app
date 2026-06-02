@@ -94,7 +94,7 @@ EXCLUDED_RELEVANCE_TERMS = (
 
 SAVE_RELEVANCE_THRESHOLD = 1
 
-APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer", "Rejected", "Archived")
+APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer", "Rejected", "Closed", "Archived")
 ACTIVE_APPLICATION_STATUSES = ("New", "Interested", "Applied", "Interview", "Offer")
 COMPANY_HEADER_VALUES = {"company", "companies"}
 JOB_TITLE_HEADER_VALUES = {"job title", "job titles", "target job title", "target job titles"}
@@ -765,6 +765,55 @@ def get_search_runs() -> pd.DataFrame:
             """,
             conn,
         )
+
+
+def update_job_cv_match(job_id: int, cv_match_score: int, cv_match_reason: str) -> None:
+    if is_supabase_connected():
+        supabase_request(
+            "PATCH",
+            "job_results",
+            params={"id": f"eq.{job_id}"},
+            json_body={
+                "cv_match_score": int(cv_match_score),
+                "cv_match_reason": cv_match_reason,
+            },
+            prefer="return=minimal",
+        )
+        return
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE job_results
+            SET cv_match_score = ?, cv_match_reason = ?
+            WHERE id = ?
+            """,
+            (int(cv_match_score), cv_match_reason, job_id),
+        )
+
+
+def recalculate_cv_matches_for_results(results: pd.DataFrame, cv_text: str) -> int:
+    if results.empty:
+        return 0
+    updated = 0
+    for row in ensure_job_ids(results).itertuples(index=False):
+        job_id = getattr(row, "id", None)
+        if clean_text(job_id) == "":
+            continue
+        try:
+            numeric_job_id = int(job_id)
+        except (TypeError, ValueError):
+            continue
+        cv_match_score, cv_match_reason = calculate_cv_match(
+            clean_text(getattr(row, "title", "")),
+            clean_text(getattr(row, "employer_name", "")),
+            clean_text(getattr(row, "description", "")),
+            clean_text(getattr(row, "searched_job_title", "")),
+            cv_text,
+        )
+        update_job_cv_match(numeric_job_id, cv_match_score, cv_match_reason)
+        updated += 1
+    return updated
 
 
 def save_search_run(
@@ -2050,7 +2099,121 @@ def send_email_summary(recipient_email: str, top_matches: pd.DataFrame) -> tuple
 
 
 def is_sponsorship_available_status(status: object) -> bool:
-    return clean_text(status) in {"sponsorship_available", "sponsorship available"}
+    return normalize_sponsorship_status(status) == "sponsorship available"
+
+
+SPONSORSHIP_STATUS_OPTIONS = (
+    "All",
+    "sponsorship available",
+    "sponsorship not available",
+    "not mentioned",
+    "requires work authorization",
+)
+
+POSSIBLE_SPONSORSHIP_STATUSES = {"sponsorship available", "not mentioned"}
+
+
+def normalize_sponsorship_status(status: object) -> str:
+    text = clean_text(status).lower().replace("_", " ")
+    if text in {"sponsorship available", "sponsorship not available", "not mentioned", "requires work authorization"}:
+        return text
+    return text or "not mentioned"
+
+
+def apply_sponsorship_filter(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+    if df.empty or "sponsorship_status" not in df.columns:
+        return df
+    status_filter = st.selectbox(
+        "Sponsorship status",
+        options=list(SPONSORSHIP_STATUS_OPTIONS),
+        index=0,
+        key=f"{key_prefix}_sponsorship_status_filter",
+    )
+    possible_only = st.checkbox(
+        "Show only possible sponsorship",
+        value=False,
+        key=f"{key_prefix}_possible_sponsorship_only",
+    )
+    filtered = df.copy()
+    normalized = filtered["sponsorship_status"].map(normalize_sponsorship_status)
+    if status_filter != "All":
+        filtered = filtered[normalized == status_filter]
+        normalized = filtered["sponsorship_status"].map(normalize_sponsorship_status)
+    if possible_only:
+        filtered = filtered[normalized.isin(POSSIBLE_SPONSORSHIP_STATUSES)]
+    return filtered
+
+
+def normalized_application_status(value: object) -> str:
+    status = clean_text(value) or "New"
+    return status if status in APPLICATION_STATUSES else "New"
+
+
+def cv_match_numeric_series(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "cv_match_score" not in df.columns:
+        return pd.Series([0] * len(df), index=df.index)
+    calculated = df.apply(is_cv_match_calculated, axis=1) if "cv_match_reason" in df.columns else pd.Series([False] * len(df), index=df.index)
+    scores = pd.to_numeric(df["cv_match_score"], errors="coerce")
+    return scores.where(calculated)
+
+
+def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = False) -> pd.DataFrame:
+    source = prepare_cv_match_display(ensure_job_ids(df))
+    for column in ["application_status", "application_notes", "sponsorship_reason"]:
+        if column not in source.columns:
+            source[column] = ""
+    source["application_status"] = source["application_status"].map(normalized_application_status)
+    source["application_notes"] = source["application_notes"].fillna("")
+    sponsorship = source["sponsorship_status"].map(normalize_sponsorship_status) if "sponsorship_status" in source.columns else ""
+    table = pd.DataFrame(
+        {
+            "Job ID": source.get("id", ""),
+            "Company": source.get("company", ""),
+            "Job Title": source.get("title", ""),
+            "Employer": source.get("employer_name", ""),
+            "Location": source.get("location", ""),
+            "Salary": source.get("salary", ""),
+            "Posted": source.get("posted_at", ""),
+            "Sponsorship Status": sponsorship,
+            "Sponsorship Reason": source.get("sponsorship_reason", ""),
+            "CV Match %": source.get("cv_match_score", ""),
+            "Relevance Score": source.get("relevance_score", ""),
+            "Apply Link": source.get("apply_link", ""),
+            "Application Status": source.get("application_status", ""),
+            "Notes": source.get("application_notes", ""),
+        }
+    )
+    if show_technical_details:
+        table["searched_job_title"] = source.get("searched_job_title", "")
+        table["run_id"] = source.get("run_id", "")
+        table["run_started_at"] = source.get("run_started_at", "")
+    return table
+
+
+def is_cv_match_calculated(row: pd.Series) -> bool:
+    reason = clean_text(row.get("cv_match_reason"))
+    return bool(reason and reason != "No CV uploaded.")
+
+
+def prepare_cv_match_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "cv_match_score" not in df.columns:
+        return df
+    prepared = df.copy()
+    if "cv_match_reason" not in prepared.columns:
+        prepared["cv_match_reason"] = ""
+    calculated_mask = prepared.apply(is_cv_match_calculated, axis=1)
+    prepared.loc[~calculated_mask, "cv_match_score"] = ""
+    prepared.loc[~calculated_mask, "cv_match_reason"] = "Not calculated"
+    return prepared
+
+
+def format_score(value: object) -> str:
+    if clean_text(value) == "" or pd.isna(value):
+        return "Not calculated"
+    try:
+        return f"{float(value):.0f}"
+    except (TypeError, ValueError):
+        return clean_text(value)
 
 
 def highlight_sponsorship_available(row: pd.Series) -> list[str]:
@@ -2164,18 +2327,18 @@ def style_top_matches(df: pd.DataFrame):
         .apply(highlight_cv_match_score, axis=1)
         .apply(highlight_relevance_score, axis=1)
         .apply(highlight_applied_status, axis=1)
-        .format({"cv_match_score": "{:.0f}", "relevance_score": "{:.0f}"})
+        .format({"cv_match_score": format_score, "relevance_score": format_score})
     )
 
 
 def top_matches_column_config() -> dict:
     return {
         "Job ID": st.column_config.TextColumn("Job ID"),
-        "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
+        "cv_match_score": st.column_config.TextColumn("CV Match %"),
         "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
         "job_url": st.column_config.LinkColumn("Job URL"),
         "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
-        "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
+        "cv_match_score": st.column_config.TextColumn("CV Match %"),
         "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
         "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
         "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
@@ -2693,7 +2856,7 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
 
 
 def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
-    st.subheader("Dashboard")
+    st.subheader("Jobs Dashboard")
     total_companies = len(companies) if companies is not None else 0
     total_job_titles = len(job_titles) if job_titles is not None else 0
     total_search_combinations = total_companies * total_job_titles
@@ -2706,114 +2869,132 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         st.info("No job results saved yet.")
         return
 
+    working = ensure_job_ids(results).copy()
+    if "application_status" not in working.columns:
+        working["application_status"] = "New"
+    if "application_notes" not in working.columns:
+        working["application_notes"] = ""
+    working["application_status"] = working["application_status"].map(normalized_application_status)
+    working["application_notes"] = working["application_notes"].fillna("")
+
     col1, col2, col3 = st.columns(3)
     col1.metric("Saved jobs", len(results))
     col2.metric("Companies", results["company"].nunique())
     col3.metric("Sponsorship available", results["sponsorship_status"].map(is_sponsorship_available_status).sum())
-    st.caption(
-        "New searches save jobs with relevance_score >= 1. Strong controls/contracts/PMO matches score highest; "
-        "infrastructure management titles need sector context."
-    )
 
-    sponsorship_options = [
-        "sponsorship_available",
-        "sponsorship_not_available",
-        "not_mentioned",
-        "sponsorship available",
-        "sponsorship not available",
-        "not mentioned",
-    ]
-    sponsorship_filter = st.multiselect(
-        "Sponsorship status",
-        options=sponsorship_options,
-        default=sponsorship_options,
-    )
-    possible_sponsorship_only = st.checkbox(
-        "Show only jobs with possible sponsorship",
-        value=False,
-    )
-    company_filter = st.multiselect(
+    st.markdown("### Filters")
+    filter_cols = st.columns(3)
+    company_filter = filter_cols[0].multiselect(
         "Company",
-        options=sorted(results["company"].dropna().unique()),
+        options=sorted(working["company"].dropna().map(clean_text).unique()),
     )
-    application_status_filter = st.selectbox(
-        "Application status",
-        options=["All statuses", *APPLICATION_STATUSES],
+    location_filter = filter_cols[1].multiselect(
+        "Location",
+        options=sorted(working["location"].dropna().map(clean_text).unique()),
     )
-    show_applied_only = st.checkbox(
-        "Show only jobs I applied to",
-        value=False,
-    )
-    top_20_per_run = st.checkbox(
-        "Show only top 20 highest relevance jobs per run",
-        value=False,
-    )
-    show_technical_details = st.checkbox(
-        "Show technical details",
-        value=False,
-    )
-    minimum_relevance_score = st.slider(
-        "Minimum relevance score",
-        min_value=1,
-        max_value=5,
-        value=2,
-        step=1,
+    application_status_filter = filter_cols[2].selectbox(
+        "Application Status",
+        options=["All", *APPLICATION_STATUSES],
     )
 
-    filtered = results[results["sponsorship_status"].isin(sponsorship_filter)]
-    if possible_sponsorship_only:
-        filtered = filtered[filtered["sponsorship_status"].map(is_sponsorship_available_status)]
+    filter_cols_2 = st.columns(3)
+    sponsorship_status_filter = filter_cols_2[0].selectbox(
+        "Sponsorship Status",
+        options=list(SPONSORSHIP_STATUS_OPTIONS),
+        index=0,
+    )
+    cv_minimum = filter_cols_2[1].slider("CV Match %", min_value=0, max_value=100, value=0, step=5)
+    relevance_minimum = filter_cols_2[2].slider("Relevance Score", min_value=0, max_value=5, value=0, step=1)
+
+    quick_cols = st.columns(3)
+    only_sponsorship_available = quick_cols[0].checkbox("Show only sponsorship available")
+    only_possible_sponsorship = quick_cols[1].checkbox("Show only possible sponsorship")
+    only_applied = quick_cols[2].checkbox("Show only applied jobs")
+
+    quick_cols_2 = st.columns(3)
+    only_interviews = quick_cols_2[0].checkbox("Show only interview jobs")
+    only_active = quick_cols_2[1].checkbox("Show only active jobs")
+    only_top_matches = quick_cols_2[2].checkbox("Show only top 20 matches")
+
+    filtered = working.copy()
+    normalized_sponsorship = filtered["sponsorship_status"].map(normalize_sponsorship_status)
+    if sponsorship_status_filter != "All":
+        filtered = filtered[normalized_sponsorship == sponsorship_status_filter]
+    if only_sponsorship_available:
+        filtered = filtered[filtered["sponsorship_status"].map(normalize_sponsorship_status) == "sponsorship available"]
+    if only_possible_sponsorship:
+        filtered = filtered[filtered["sponsorship_status"].map(normalize_sponsorship_status).isin(POSSIBLE_SPONSORSHIP_STATUSES)]
     if company_filter:
-        filtered = filtered[filtered["company"].isin(company_filter)]
-    if show_applied_only:
-        filtered = filtered[filtered["application_status"] == "Applied"]
-    elif application_status_filter != "All statuses":
+        filtered = filtered[filtered["company"].map(clean_text).isin(company_filter)]
+    if location_filter:
+        filtered = filtered[filtered["location"].map(clean_text).isin(location_filter)]
+    if application_status_filter != "All":
         filtered = filtered[filtered["application_status"] == application_status_filter]
-    filtered = filtered[filtered["relevance_score"] >= minimum_relevance_score]
-    if top_20_per_run:
-        filtered = top_jobs_per_run(filtered, limit=20)
+    if only_applied:
+        filtered = filtered[filtered["application_status"] == "Applied"]
+    if only_interviews:
+        filtered = filtered[filtered["application_status"] == "Interview"]
+    if only_active:
+        filtered = filtered[filtered["application_status"].isin(ACTIVE_APPLICATION_STATUSES)]
+    filtered = filtered[pd.to_numeric(filtered["relevance_score"], errors="coerce").fillna(0) >= relevance_minimum]
+    cv_scores = cv_match_numeric_series(filtered)
+    filtered = filtered[(cv_scores.fillna(-1) >= cv_minimum) | (cv_minimum == 0)]
+    if only_top_matches:
+        filtered = top_best_matches(deduplicate_top_matches(filtered), limit=20)
 
-    table_column_config = {
-        "Job ID": st.column_config.TextColumn("Job ID"),
-        "job_url": st.column_config.LinkColumn("Job URL"),
-        "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
-        "sponsorship_reason": st.column_config.TextColumn("Sponsorship reason", width="medium"),
-        "relevance_reason": st.column_config.TextColumn("Relevance reason", width="medium"),
-        "cv_match_reason": st.column_config.TextColumn("CV match reason", width="medium"),
-        "application_status": st.column_config.TextColumn("status"),
-        "applied_date": st.column_config.TextColumn("Applied date"),
-        "application_notes": st.column_config.TextColumn("notes", width="large"),
-        "description": st.column_config.TextColumn("Description", width="large"),
-    }
-
-    st.subheader("Top 20 best matches")
-    top_matches = top_best_matches(deduplicate_top_matches(filtered), limit=20)
-    if top_matches.empty:
+    st.markdown("### All Matching Jobs")
+    if filtered.empty:
         st.info("No jobs match the current filters.")
-    else:
-        st.caption("Sorted by CV match score, relevance score, salary when available, then posting recency.")
-        top_matches = display_job_id_column(reorder_top_match_columns(top_matches, show_technical_details))
-        styled_top_matches = style_top_matches(top_matches)
-        st.dataframe(
-            styled_top_matches,
-            use_container_width=True,
-            hide_index=True,
-            column_config=top_matches_column_config(),
-    )
+        return
 
-    st.subheader("All matching jobs")
-    display_filtered = display_job_id_column(reorder_job_columns(filtered, show_technical_details))
-    styled_filtered = (
-        display_filtered.style.apply(highlight_sponsorship_available, axis=1)
-        .apply(highlight_cv_match_score, axis=1)
-        .apply(highlight_applied_status, axis=1)
-    )
-    st.dataframe(
-        styled_filtered,
+    show_technical_details = st.checkbox("Show technical details", value=False)
+    master_table = dashboard_master_table(filtered, show_technical_details=show_technical_details)
+    edited = st.data_editor(
+        master_table,
         use_container_width=True,
         hide_index=True,
-        column_config=table_column_config,
+        disabled=[
+            column
+            for column in master_table.columns
+            if column not in {"Application Status", "Notes"}
+        ],
+        column_config={
+            "Job ID": st.column_config.TextColumn("Job ID"),
+            "Company": st.column_config.TextColumn("Company"),
+            "Job Title": st.column_config.TextColumn("Job Title"),
+            "Employer": st.column_config.TextColumn("Employer"),
+            "Location": st.column_config.TextColumn("Location"),
+            "Salary": st.column_config.TextColumn("Salary"),
+            "Posted": st.column_config.TextColumn("Posted"),
+            "Sponsorship Status": st.column_config.TextColumn("Sponsorship Status"),
+            "Sponsorship Reason": st.column_config.TextColumn("Sponsorship Reason", width="medium"),
+            "CV Match %": st.column_config.TextColumn("CV Match %"),
+            "Relevance Score": st.column_config.NumberColumn("Relevance Score", format="%d"),
+            "Apply Link": st.column_config.LinkColumn("Apply Link", display_text="Apply Now"),
+            "Application Status": st.column_config.SelectboxColumn(
+                "Application Status",
+                options=list(APPLICATION_STATUSES),
+                required=True,
+            ),
+            "Notes": st.column_config.TextColumn("Notes", width="large"),
+            "searched_job_title": st.column_config.TextColumn("searched_job_title"),
+            "run_id": st.column_config.TextColumn("run_id"),
+            "run_started_at": st.column_config.TextColumn("run_started_at"),
+        },
     )
+
+    if st.button("Save Dashboard Updates", type="primary"):
+        for _, row in edited.iterrows():
+            job_id = clean_text(row.get("Job ID"))
+            if not job_id:
+                continue
+            update_job_tracking(
+                int(job_id),
+                clean_text(row.get("Application Status")),
+                clean_text(row.get("Notes")),
+            )
+        st.success("Dashboard updates saved.")
+        st.rerun()
 
     include_search_metadata = st.checkbox(
         "Include search metadata",
@@ -2831,149 +3012,6 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
     )
 
 
-def render_top_matches(results: pd.DataFrame) -> None:
-    st.subheader("Top Matches")
-    if results.empty:
-        st.info("No job results saved yet.")
-        return
-    show_technical_details = st.checkbox("Show technical details", value=False, key="top_matches_show_technical_details")
-    top_matches = top_best_matches(deduplicate_top_matches(results), limit=20)
-    top_matches = display_job_id_column(reorder_top_match_columns(top_matches, show_technical_details))
-    st.caption("Sorted by CV Match %, Relevance, salary when available, and posted_at recency.")
-    st.dataframe(
-        style_top_matches(top_matches),
-        use_container_width=True,
-        hide_index=True,
-        column_config=top_matches_column_config(),
-    )
-
-
-def render_application_tracker(results: pd.DataFrame) -> None:
-    st.subheader("Application Tracker")
-    if results.empty:
-        st.info("No job results saved yet.")
-        return
-
-    tracker_source = ensure_job_ids(results)
-    if "application_status" not in tracker_source.columns:
-        tracker_source["application_status"] = tracker_source.get("status", "New")
-    if "application_notes" not in tracker_source.columns:
-        tracker_source["application_notes"] = tracker_source.get("notes", "")
-    if "applied_date" not in tracker_source.columns:
-        tracker_source["applied_date"] = ""
-
-    tracker_source["application_status"] = tracker_source["application_status"].fillna("New").replace("", "New")
-    tracker_source["application_notes"] = tracker_source["application_notes"].fillna("")
-    tracker_source["applied_date"] = tracker_source["applied_date"].fillna("")
-
-    total_applied = int((tracker_source["application_status"] == "Applied").sum())
-    total_interviews = int((tracker_source["application_status"] == "Interview").sum())
-    total_offers = int((tracker_source["application_status"] == "Offer").sum())
-    stat_col1, stat_col2, stat_col3 = st.columns(3)
-    stat_col1.metric("Total Applied", total_applied)
-    stat_col2.metric("Interviews", total_interviews)
-    stat_col3.metric("Offers", total_offers)
-
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
-    show_applied = filter_col1.checkbox("Show only Applied", value=False)
-    show_interviews = filter_col2.checkbox("Show only Interviews", value=False)
-    show_active = filter_col3.checkbox("Show only Active jobs", value=False)
-    show_technical_details = st.checkbox("Show technical details", value=False, key="tracker_show_technical_details")
-
-    filtered_tracker = tracker_source
-    selected_statuses = []
-    if show_applied:
-        selected_statuses.append("Applied")
-    if show_interviews:
-        selected_statuses.append("Interview")
-    if selected_statuses:
-        filtered_tracker = filtered_tracker[filtered_tracker["application_status"].isin(selected_statuses)]
-    if show_active:
-        filtered_tracker = filtered_tracker[filtered_tracker["application_status"].isin(ACTIVE_APPLICATION_STATUSES)]
-
-    tracker_columns = [
-        "id",
-        "company",
-        "title",
-        "employer_name",
-        "location",
-        "salary",
-        "posted_at",
-        "schedule_type",
-        "sponsorship_status",
-        "cv_match_score",
-        "relevance_score",
-        "apply_link",
-        "application_status",
-        "applied_date",
-        "application_notes",
-    ]
-    if show_technical_details:
-        tracker_columns.extend(["run_id", "run_started_at"])
-    tracker_df = filtered_tracker[[column for column in tracker_columns if column in filtered_tracker.columns]].copy()
-    if tracker_df.empty:
-        st.info("No applications match the current tracker filters.")
-        return
-
-    tracker_df = display_job_id_column(tracker_df)
-    tracker_df.insert(0, "select", False)
-    edited = st.data_editor(
-        tracker_df,
-        use_container_width=True,
-        hide_index=True,
-        disabled=[
-            column
-            for column in tracker_df.columns
-            if column not in {"select", "application_status", "applied_date", "application_notes"}
-        ],
-        column_config={
-            "select": st.column_config.CheckboxColumn("Select"),
-            "Job ID": st.column_config.TextColumn("Job ID"),
-            "cv_match_score": st.column_config.NumberColumn("CV Match %", format="%d"),
-            "relevance_score": st.column_config.NumberColumn("Relevance", format="%d"),
-            "application_status": st.column_config.SelectboxColumn(
-                "status",
-                options=list(APPLICATION_STATUSES),
-                required=True,
-            ),
-            "applied_date": st.column_config.TextColumn("Applied date"),
-            "application_notes": st.column_config.TextColumn("notes", width="large"),
-            "apply_link": st.column_config.LinkColumn("Apply", display_text="Apply Now"),
-        },
-    )
-
-    save_col, applied_col = st.columns([1, 1])
-    if save_col.button("Save Tracker Updates", type="primary"):
-        edited_for_save = edited.rename(columns={"Job ID": "id"})
-        for row in edited_for_save.itertuples(index=False):
-            update_job_tracking(
-                int(getattr(row, "id")),
-                clean_text(getattr(row, "application_status")),
-                clean_text(getattr(row, "application_notes")),
-                clean_text(getattr(row, "applied_date")),
-            )
-        st.success("Tracker updates saved.")
-        st.rerun()
-
-    if applied_col.button("Mark as Applied"):
-        selected_rows = edited[edited["select"] == True]
-        if selected_rows.empty:
-            st.warning("Select at least one job to mark as applied.")
-            return
-
-        applied_timestamp = utc_now()
-        selected_rows = selected_rows.rename(columns={"Job ID": "id"})
-        for row in selected_rows.itertuples(index=False):
-            update_job_tracking(
-                int(getattr(row, "id")),
-                "Applied",
-                clean_text(getattr(row, "application_notes")),
-                applied_timestamp,
-            )
-        st.success(f"Marked {len(selected_rows)} job(s) as applied.")
-        st.rerun()
-
-
 def render_search_runs() -> None:
     st.subheader("Saved Search Runs")
     runs = get_search_runs()
@@ -2987,6 +3025,11 @@ def render_settings(results: pd.DataFrame) -> None:
     st.subheader("Settings")
 
     st.markdown("### CV / Resume Matching")
+    saved_cv_text, _ = get_cv_profile()
+    active_cv_text = clean_text(st.session_state.get("cv_text", "")) or saved_cv_text
+    if active_cv_text and not clean_text(st.session_state.get("cv_text", "")):
+        st.session_state["cv_text"] = active_cv_text
+    st.caption(f"Saved CV text loaded: {'yes' if active_cv_text else 'no'}")
     cv_file = st.file_uploader("Upload CV / resume as PDF or DOCX", type=["pdf", "docx"])
     if cv_file is not None and st.button("Extract CV Text"):
         try:
@@ -3002,6 +3045,19 @@ def render_settings(results: pd.DataFrame) -> None:
             st.error("Could not read file, please try another format")
     if st.session_state.get("cv_text"):
         st.caption(f"Current CV text loaded: {len(st.session_state['cv_text']):,} characters.")
+
+    if st.button("Recalculate CV Match for All Saved Jobs"):
+        active_cv_text = clean_text(st.session_state.get("cv_text", "")) or clean_text(get_cv_profile()[0])
+        if not active_cv_text:
+            st.warning("Please upload and extract CV before calculating CV match.")
+            return
+        all_results = get_results()
+        if all_results.empty:
+            st.info("No saved jobs found to recalculate.")
+            return
+        updated_count = recalculate_cv_matches_for_results(all_results, active_cv_text)
+        st.success(f"Recalculated CV match for {updated_count} saved job(s).")
+        st.rerun()
 
 
 def render_local_recovery_section() -> None:
@@ -3179,9 +3235,12 @@ def main() -> None:
     search_runs = get_search_runs()
     visible_results = render_history_overview(results, search_runs)
 
-    upload_tab, search_tab, dashboard_tab, top_matches_tab, tracker_tab, settings_tab = st.tabs(
-        ["Upload Targets", "Run Search", "Dashboard", "Top Matches", "Application Tracker", "Settings"]
+    dashboard_tab, upload_tab, search_tab, settings_tab = st.tabs(
+        ["Dashboard", "Upload Targets", "Run Search", "Settings"]
     )
+
+    with dashboard_tab:
+        render_dashboard(visible_results, companies, job_titles)
 
     with upload_tab:
         render_upload_section()
@@ -3205,15 +3264,6 @@ def main() -> None:
         render_search_section(companies, job_titles)
         st.divider()
         render_search_runs()
-
-    with dashboard_tab:
-        render_dashboard(visible_results, companies, job_titles)
-
-    with top_matches_tab:
-        render_top_matches(visible_results)
-
-    with tracker_tab:
-        render_application_tracker(visible_results)
 
     with settings_tab:
         render_settings(visible_results)
