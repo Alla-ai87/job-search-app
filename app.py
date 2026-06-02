@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -101,8 +102,11 @@ JOB_TITLE_HEADER_VALUES = {"job title", "job titles", "target job title", "targe
 
 RESULT_COLUMNS = [
     "id",
+    "job_fingerprint",
     "run_id",
     "run_started_at",
+    "first_seen_at",
+    "last_seen_at",
     "company",
     "searched_job_title",
     "title",
@@ -127,6 +131,8 @@ RESULT_COLUMNS = [
     "apply_link",
     "description",
     "created_at",
+    "updated_at",
+    "merged_into_id",
 ]
 
 REQUIRED_SUPABASE_TABLES = (
@@ -233,7 +239,10 @@ def supabase_request(
 
 def check_supabase_table(table_name: str) -> tuple[bool, str]:
     try:
-        supabase_request("GET", table_name, params={"select": "*", "limit": 1})
+        select_columns = "*"
+        if table_name == "job_results":
+            select_columns = ",".join(RESULT_COLUMNS)
+        supabase_request("GET", table_name, params={"select": select_columns, "limit": 1})
     except requests.HTTPError as exc:
         return False, str(exc)
     except requests.RequestException as exc:
@@ -379,8 +388,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS job_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 result_key TEXT NOT NULL UNIQUE,
+                job_fingerprint TEXT,
                 run_id TEXT NOT NULL DEFAULT 'legacy',
                 run_started_at TEXT,
+                first_seen_at TEXT,
+                last_seen_at TEXT,
                 company TEXT NOT NULL,
                 searched_job_title TEXT NOT NULL,
                 title TEXT,
@@ -405,10 +417,17 @@ def init_db() -> None:
                 applied_date TEXT,
                 application_notes TEXT DEFAULT '',
                 raw_json TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                merged_into_id INTEGER
             )
             """
         )
+        ensure_column(conn, "job_results", "job_fingerprint", "TEXT")
+        ensure_column(conn, "job_results", "first_seen_at", "TEXT")
+        ensure_column(conn, "job_results", "last_seen_at", "TEXT")
+        ensure_column(conn, "job_results", "merged_into_id", "INTEGER")
+        ensure_column(conn, "job_results", "updated_at", "TEXT")
         ensure_column(conn, "job_results", "sponsorship_reason", "TEXT")
         ensure_column(conn, "job_results", "relevance_score", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "job_results", "relevance_reason", "TEXT")
@@ -444,6 +463,14 @@ def init_db() -> None:
             UPDATE job_results
             SET application_notes = COALESCE(notes, '')
             WHERE application_notes IS NULL OR application_notes = ''
+            """
+        )
+        migrate_sqlite_job_fingerprints(conn)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_job_results_job_fingerprint_active
+            ON job_results(job_fingerprint)
+            WHERE merged_into_id IS NULL
             """
         )
         conn.execute(
@@ -514,6 +541,66 @@ def clean_text(value: object) -> str:
     if value is None or pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def normalize_identity_text(value: object) -> str:
+    return re.sub(r"\s+", " ", clean_text(value).lower()).strip()
+
+
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_PARAMS = {
+    "fbclid",
+    "gclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "ref",
+    "source",
+}
+
+
+def normalize_identity_url(value: object) -> str:
+    url = clean_text(value)
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return normalize_identity_text(url)
+
+    scheme = parts.scheme.lower() or "https"
+    netloc = parts.netloc.lower()
+    path = re.sub(r"/+$", "", parts.path or "")
+    filtered_query = []
+    for key, query_value in parse_qsl(parts.query, keep_blank_values=False):
+        normalized_key = key.lower()
+        if normalized_key in TRACKING_QUERY_PARAMS:
+            continue
+        if any(normalized_key.startswith(prefix) for prefix in TRACKING_QUERY_PREFIXES):
+            continue
+        filtered_query.append((normalized_key, query_value.strip()))
+    query = urlencode(sorted(filtered_query))
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def make_job_fingerprint(
+    employer_name: object,
+    title: object,
+    location: object,
+    apply_link: object = "",
+    job_url: object = "",
+) -> str:
+    identity = "|".join(
+        [
+            normalize_identity_text(employer_name),
+            normalize_identity_text(title),
+            normalize_identity_text(location),
+            normalize_identity_url(apply_link),
+            normalize_identity_url(job_url),
+        ]
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def normalize_lookup_value(value: object) -> str:
@@ -641,15 +728,13 @@ def get_targets() -> pd.DataFrame:
 
 
 def stable_job_id_from_row(row: pd.Series) -> str:
-    identity = "|".join(
-        [
-            clean_text(row.get("title")).lower(),
-            clean_text(row.get("employer_name")).lower(),
-            clean_text(row.get("location")).lower(),
-            clean_text(row.get("apply_link")).lower(),
-        ]
+    return make_job_fingerprint(
+        row.get("employer_name"),
+        row.get("title"),
+        row.get("location"),
+        row.get("apply_link"),
+        row.get("job_url"),
     )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
 def ensure_job_ids(df: pd.DataFrame) -> pd.DataFrame:
@@ -673,12 +758,72 @@ def display_job_id_column(df: pd.DataFrame) -> pd.DataFrame:
     return prepared.rename(columns={"id": "Job ID"})
 
 
+def merge_tracking_data(results: pd.DataFrame) -> pd.DataFrame:
+    if results.empty:
+        return results
+    merged = results.copy()
+    for column, default in [("application_status", "New"), ("application_notes", ""), ("notes", "")]:
+        if column not in merged.columns:
+            merged[column] = default
+
+    if is_supabase_connected():
+        try:
+            tracker_rows = supabase_request(
+                "GET",
+                "application_tracker",
+                params={"select": "job_id,application_status,applied_date,application_notes,updated_at"},
+            )
+            notes_rows = supabase_request(
+                "GET",
+                "notes",
+                params={"select": "job_id,note_text,updated_at"},
+            )
+        except requests.RequestException:
+            tracker_rows = []
+            notes_rows = []
+    else:
+        with get_connection() as conn:
+            tracker_rows = [dict(row) for row in conn.execute("SELECT job_id, application_status, applied_date, application_notes, updated_at FROM application_tracker").fetchall()]
+            notes_rows = [dict(row) for row in conn.execute("SELECT job_id, note_text, updated_at FROM notes").fetchall()]
+
+    tracker_by_job_id = {clean_text(row.get("job_id")): row for row in tracker_rows if clean_text(row.get("job_id"))}
+    notes_by_job_id = {clean_text(row.get("job_id")): row for row in notes_rows if clean_text(row.get("job_id"))}
+
+    for index, row in merged.iterrows():
+        lookup_keys = [clean_text(row.get("id")), clean_text(row.get("job_fingerprint"))]
+        tracker = next((tracker_by_job_id[key] for key in lookup_keys if key in tracker_by_job_id), None)
+        note = next((notes_by_job_id[key] for key in lookup_keys if key in notes_by_job_id), None)
+        if tracker:
+            merged.at[index, "application_status"] = normalized_application_status(tracker.get("application_status"))
+            merged.at[index, "status"] = normalized_application_status(tracker.get("application_status"))
+            merged.at[index, "application_notes"] = clean_text(tracker.get("application_notes"))
+            merged.at[index, "notes"] = clean_text(tracker.get("application_notes"))
+            if clean_text(tracker.get("applied_date")):
+                merged.at[index, "applied_date"] = clean_text(tracker.get("applied_date"))
+        if note and clean_text(note.get("note_text")):
+            merged.at[index, "application_notes"] = clean_text(note.get("note_text"))
+            merged.at[index, "notes"] = clean_text(note.get("note_text"))
+
+    merged["application_status"] = merged["application_status"].map(normalized_application_status)
+    merged["application_notes"] = merged["application_notes"].fillna("").map(clean_text)
+    if "status" in merged.columns:
+        legacy_status = merged["status"].map(normalized_application_status)
+        use_legacy_status = (merged["application_status"] == "New") & (legacy_status != "New")
+        merged.loc[use_legacy_status, "application_status"] = legacy_status.loc[use_legacy_status]
+    if "notes" in merged.columns:
+        legacy_notes = merged["notes"].fillna("").map(clean_text)
+        use_legacy_notes = (merged["application_notes"] == "") & (legacy_notes != "")
+        merged.loc[use_legacy_notes, "application_notes"] = legacy_notes.loc[use_legacy_notes]
+    merged["notes"] = merged["application_notes"]
+    return merged
+
+
 def get_results() -> pd.DataFrame:
     if is_supabase_connected():
         rows = supabase_request(
             "GET",
             "job_results",
-            params={"select": ",".join(RESULT_COLUMNS), "order": "created_at.desc"},
+            params={"select": ",".join(RESULT_COLUMNS), "merged_into_id": "is.null", "order": "created_at.desc"},
         )
         results = dataframe_from_rows(rows, RESULT_COLUMNS)
         if not results.empty:
@@ -687,15 +832,18 @@ def get_results() -> pd.DataFrame:
                 ascending=[False, False, False],
                 na_position="last",
             )
-        return ensure_job_ids(results)
+        return merge_tracking_data(ensure_job_ids(results))
 
     with get_connection() as conn:
         results = pd.read_sql_query(
             """
             SELECT
                 id,
+                job_fingerprint,
                 run_id,
                 run_started_at,
+                first_seen_at,
+                last_seen_at,
                 company,
                 searched_job_title,
                 title,
@@ -719,13 +867,16 @@ def get_results() -> pd.DataFrame:
                 job_url,
                 apply_link,
                 description,
-                created_at
+                created_at,
+                updated_at,
+                merged_into_id
             FROM job_results
+            WHERE merged_into_id IS NULL
             ORDER BY COALESCE(run_started_at, created_at) DESC, relevance_score DESC, company, searched_job_title
             """,
             conn,
         )
-    return ensure_job_ids(results)
+    return merge_tracking_data(ensure_job_ids(results))
 
 
 def get_search_runs() -> pd.DataFrame:
@@ -864,30 +1015,48 @@ def save_search_run(
         )
 
 
-def update_job_tracking(job_id: int, application_status: str, application_notes: str, applied_date: str = "") -> None:
+def update_job_tracking(
+    job_id: object,
+    application_status: str,
+    application_notes: str,
+    applied_date: str = "",
+    job_fingerprint: str = "",
+) -> bool:
     if application_status not in APPLICATION_STATUSES:
         application_status = "New"
+    job_id_text = clean_text(job_id)
+    fingerprint = clean_text(job_fingerprint)
+    try:
+        numeric_job_id = int(job_id_text)
+    except (TypeError, ValueError):
+        numeric_job_id = None
+
     if is_supabase_connected():
         updated_at = utc_now()
+        params = {"id": f"eq.{numeric_job_id}"} if numeric_job_id is not None else {"job_fingerprint": f"eq.{fingerprint}"}
+        if numeric_job_id is None and not fingerprint:
+            return False
         supabase_request(
             "PATCH",
             "job_results",
-            params={"id": f"eq.{job_id}"},
+            params=params,
             json_body={
                 "application_status": application_status,
                 "application_notes": application_notes,
                 "applied_date": applied_date or None,
                 "status": application_status,
                 "notes": application_notes,
+                "updated_at": updated_at,
             },
             prefer="return=minimal",
         )
+        tracker_job_id = str(numeric_job_id) if numeric_job_id is not None else fingerprint
         supabase_upsert(
             "application_tracker",
             [
                 {
-                    "job_id": str(job_id),
-                    "job_result_id": job_id,
+                    "job_id": tracker_job_id,
+                    "job_result_id": numeric_job_id,
                     "application_status": application_status,
                     "application_notes": application_notes,
                     "applied_date": applied_date or None,
@@ -900,30 +1069,76 @@ def update_job_tracking(job_id: int, application_status: str, application_notes:
             "notes",
             [
                 {
-                    "job_id": str(job_id),
-                    "job_result_id": job_id,
+                    "job_id": tracker_job_id,
+                    "job_result_id": numeric_job_id,
                     "note_text": application_notes,
                     "updated_at": updated_at,
                 }
             ],
             "job_id",
         )
-        return
+        return True
 
+    if numeric_job_id is None and not fingerprint:
+        return False
     with get_connection() as conn:
+        updated_at = utc_now()
+        if numeric_job_id is not None:
+            conn.execute(
+                """
+                UPDATE job_results
+                SET
+                    application_status = ?,
+                    application_notes = ?,
+                    applied_date = ?,
+                    status = ?,
+                    notes = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (application_status, application_notes, applied_date, application_status, application_notes, updated_at, numeric_job_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE job_results
+                SET
+                    application_status = ?,
+                    application_notes = ?,
+                    applied_date = ?,
+                    status = ?,
+                    notes = ?,
+                    updated_at = ?
+                WHERE job_fingerprint = ? AND merged_into_id IS NULL
+                """,
+                (application_status, application_notes, applied_date, application_status, application_notes, updated_at, fingerprint),
+            )
+        tracker_job_id = str(numeric_job_id) if numeric_job_id is not None else fingerprint
         conn.execute(
             """
-            UPDATE job_results
-            SET
-                application_status = ?,
-                application_notes = ?,
-                applied_date = ?,
-                status = ?,
-                notes = ?
-            WHERE id = ?
+            INSERT INTO application_tracker (job_id, job_result_id, application_status, applied_date, application_notes, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                job_result_id = excluded.job_result_id,
+                application_status = excluded.application_status,
+                applied_date = excluded.applied_date,
+                application_notes = excluded.application_notes,
+                updated_at = excluded.updated_at
             """,
-            (application_status, application_notes, applied_date, application_status, application_notes, job_id),
+            (tracker_job_id, numeric_job_id, application_status, applied_date, application_notes, updated_at),
         )
+        conn.execute(
+            """
+            INSERT INTO notes (job_id, job_result_id, note_text, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                job_result_id = excluded.job_result_id,
+                note_text = excluded.note_text,
+                updated_at = excluded.updated_at
+            """,
+            (tracker_job_id, numeric_job_id, application_notes, updated_at),
+        )
+    return True
 
 
 def save_cv_profile(cv_text: str, cv_summary: str = "") -> None:
@@ -1514,6 +1729,267 @@ def make_result_key(company: str, searched_job_title: str, job: dict) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+STATUS_PRIORITY = {
+    "New": 0,
+    "Interested": 1,
+    "Applied": 2,
+    "Interview": 3,
+    "Offer": 4,
+    "Rejected": 5,
+    "Closed": 6,
+    "Archived": 7,
+}
+
+SPONSORSHIP_PRIORITY = {
+    "sponsorship not available": 0,
+    "not mentioned": 1,
+    "requires work authorization": 2,
+    "sponsorship available": 3,
+}
+
+
+def best_application_status(*statuses: object) -> str:
+    cleaned = [normalized_application_status(status) for status in statuses]
+    return max(cleaned or ["New"], key=lambda status: STATUS_PRIORITY.get(status, 0))
+
+
+def best_non_empty(*values: object) -> str:
+    for value in values:
+        text = clean_text(value)
+        if text:
+            return text
+    return ""
+
+
+def max_numeric(*values: object) -> int:
+    numeric_values = pd.to_numeric(pd.Series(list(values)), errors="coerce").dropna()
+    if numeric_values.empty:
+        return 0
+    return int(numeric_values.max())
+
+
+def best_sponsorship_status(existing_status: object, new_status: object) -> str:
+    existing = normalize_sponsorship_status(existing_status)
+    new = normalize_sponsorship_status(new_status)
+    return new if SPONSORSHIP_PRIORITY.get(new, 0) > SPONSORSHIP_PRIORITY.get(existing, 0) else existing
+
+
+def best_posted_at(existing_posted_at: object, new_posted_at: object, existing_created_at: object = "", new_created_at: object = "") -> str:
+    existing_text = clean_text(existing_posted_at)
+    new_text = clean_text(new_posted_at)
+    if not existing_text:
+        return new_text
+    if not new_text:
+        return existing_text
+    existing_score = parse_recency_score(existing_text, existing_created_at)
+    new_score = parse_recency_score(new_text, new_created_at)
+    return new_text if new_score > existing_score else existing_text
+
+
+def job_fingerprint_from_values(employer_name: str, title: str, location: str, apply_link: str, job_url: str) -> str:
+    return make_job_fingerprint(employer_name, title, location, apply_link, job_url)
+
+
+def job_fingerprint_from_job(job: dict) -> str:
+    return job_fingerprint_from_values(
+        get_employer_name(job),
+        clean_text(job.get("title")),
+        clean_text(job.get("location")),
+        best_apply_link(job),
+        normalize_job_url(job),
+    )
+
+
+def merge_job_record_values(records: list[dict]) -> dict:
+    sorted_records = sorted(records, key=lambda item: (clean_text(item.get("first_seen_at")) or clean_text(item.get("created_at")), int(item.get("id") or 0)))
+    keeper = sorted_records[0].copy()
+    for record in sorted_records[1:]:
+        keeper["application_status"] = best_application_status(keeper.get("application_status"), record.get("application_status"), keeper.get("status"), record.get("status"))
+        keeper["status"] = keeper["application_status"]
+        keeper["application_notes"] = best_non_empty(keeper.get("application_notes"), record.get("application_notes"), keeper.get("notes"), record.get("notes"))
+        keeper["notes"] = keeper["application_notes"]
+        keeper["applied_date"] = best_non_empty(keeper.get("applied_date"), record.get("applied_date"))
+        keeper["relevance_score"] = max_numeric(keeper.get("relevance_score"), record.get("relevance_score"))
+        keeper["cv_match_score"] = max_numeric(keeper.get("cv_match_score"), record.get("cv_match_score"))
+        keeper["relevance_reason"] = best_non_empty(keeper.get("relevance_reason"), record.get("relevance_reason"))
+        keeper["cv_match_reason"] = best_non_empty(keeper.get("cv_match_reason"), record.get("cv_match_reason"))
+        keeper["salary"] = best_non_empty(keeper.get("salary"), record.get("salary"))
+        keeper["sponsorship_status"] = best_sponsorship_status(keeper.get("sponsorship_status"), record.get("sponsorship_status"))
+        keeper["sponsorship_reason"] = best_non_empty(keeper.get("sponsorship_reason"), record.get("sponsorship_reason"))
+        keeper["first_seen_at"] = min(
+            [value for value in [clean_text(keeper.get("first_seen_at")), clean_text(record.get("first_seen_at")), clean_text(keeper.get("created_at")), clean_text(record.get("created_at"))] if value]
+        )
+        keeper["last_seen_at"] = max(
+            [value for value in [clean_text(keeper.get("last_seen_at")), clean_text(record.get("last_seen_at")), clean_text(keeper.get("run_started_at")), clean_text(record.get("run_started_at"))] if value]
+        )
+    return keeper
+
+
+def row_job_fingerprint(row: dict | pd.Series) -> str:
+    return make_job_fingerprint(
+        row.get("employer_name"),
+        row.get("title"),
+        row.get("location"),
+        row.get("apply_link"),
+        row.get("job_url"),
+    )
+
+
+def migrate_sqlite_job_fingerprints(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT * FROM job_results").fetchall()
+    if not rows:
+        return
+    records = [dict(row) for row in rows]
+    now = utc_now()
+    for record in records:
+        fingerprint = clean_text(record.get("job_fingerprint")) or row_job_fingerprint(record)
+        first_seen_at = clean_text(record.get("first_seen_at")) or clean_text(record.get("created_at")) or now
+        last_seen_at = clean_text(record.get("last_seen_at")) or clean_text(record.get("run_started_at")) or first_seen_at
+        conn.execute(
+            """
+            UPDATE job_results
+            SET job_fingerprint = ?, first_seen_at = ?, last_seen_at = ?
+            WHERE id = ?
+            """,
+            (fingerprint, first_seen_at, last_seen_at, record.get("id")),
+        )
+
+    refreshed = [dict(row) for row in conn.execute("SELECT * FROM job_results WHERE merged_into_id IS NULL")]
+    groups: dict[str, list[dict]] = {}
+    for record in refreshed:
+        fingerprint = clean_text(record.get("job_fingerprint"))
+        if fingerprint:
+            groups.setdefault(fingerprint, []).append(record)
+
+    for fingerprint, duplicate_records in groups.items():
+        if len(duplicate_records) < 2:
+            continue
+        merged = merge_job_record_values(duplicate_records)
+        keeper_id = int(merged["id"])
+        conn.execute(
+            """
+            UPDATE job_results
+            SET
+                application_status = ?,
+                status = ?,
+                application_notes = ?,
+                notes = ?,
+                applied_date = ?,
+                relevance_score = ?,
+                cv_match_score = ?,
+                relevance_reason = ?,
+                cv_match_reason = ?,
+                salary = ?,
+                sponsorship_status = ?,
+                sponsorship_reason = ?,
+                first_seen_at = ?,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (
+                merged.get("application_status"),
+                merged.get("status"),
+                merged.get("application_notes"),
+                merged.get("notes"),
+                merged.get("applied_date"),
+                merged.get("relevance_score"),
+                merged.get("cv_match_score"),
+                merged.get("relevance_reason"),
+                merged.get("cv_match_reason"),
+                merged.get("salary"),
+                merged.get("sponsorship_status"),
+                merged.get("sponsorship_reason"),
+                merged.get("first_seen_at"),
+                merged.get("last_seen_at"),
+                keeper_id,
+            ),
+        )
+        for record in duplicate_records:
+            duplicate_id = int(record["id"])
+            if duplicate_id != keeper_id:
+                conn.execute("UPDATE job_results SET merged_into_id = ? WHERE id = ?", (keeper_id, duplicate_id))
+
+
+def migrate_supabase_job_fingerprints() -> None:
+    if st.session_state.get("job_fingerprint_migration_done"):
+        return
+    try:
+        rows = supabase_request(
+            "GET",
+            "job_results",
+            params={"select": ",".join(RESULT_COLUMNS), "order": "created_at.asc"},
+        )
+    except requests.RequestException:
+        return
+    if not rows:
+        st.session_state["job_fingerprint_migration_done"] = True
+        return
+
+    now = utc_now()
+    grouped: dict[str, list[dict]] = {}
+    for record in rows:
+        fingerprint = clean_text(record.get("job_fingerprint")) or row_job_fingerprint(record)
+        first_seen_at = clean_text(record.get("first_seen_at")) or clean_text(record.get("created_at")) or now
+        last_seen_at = clean_text(record.get("last_seen_at")) or clean_text(record.get("run_started_at")) or first_seen_at
+        record["job_fingerprint"] = fingerprint
+        record["first_seen_at"] = first_seen_at
+        record["last_seen_at"] = last_seen_at
+        if not clean_text(record.get("merged_into_id")):
+            grouped.setdefault(fingerprint, []).append(record)
+        if not clean_text(record.get("job_fingerprint")) or not clean_text(record.get("first_seen_at")) or not clean_text(record.get("last_seen_at")):
+            continue
+        supabase_request(
+            "PATCH",
+            "job_results",
+            params={"id": f"eq.{record.get('id')}"},
+            json_body={
+                "job_fingerprint": fingerprint,
+                "first_seen_at": first_seen_at,
+                "last_seen_at": last_seen_at,
+            },
+            prefer="return=minimal",
+        )
+
+    for fingerprint, duplicate_records in grouped.items():
+        if len(duplicate_records) < 2:
+            continue
+        merged = merge_job_record_values(duplicate_records)
+        keeper_id = int(merged["id"])
+        supabase_request(
+            "PATCH",
+            "job_results",
+            params={"id": f"eq.{keeper_id}"},
+            json_body={
+                "application_status": merged.get("application_status"),
+                "status": merged.get("status"),
+                "application_notes": merged.get("application_notes"),
+                "notes": merged.get("notes"),
+                "applied_date": merged.get("applied_date") or None,
+                "relevance_score": int(merged.get("relevance_score") or 0),
+                "cv_match_score": int(merged.get("cv_match_score") or 0),
+                "relevance_reason": merged.get("relevance_reason"),
+                "cv_match_reason": merged.get("cv_match_reason"),
+                "salary": merged.get("salary"),
+                "sponsorship_status": merged.get("sponsorship_status"),
+                "sponsorship_reason": merged.get("sponsorship_reason"),
+                "first_seen_at": merged.get("first_seen_at"),
+                "last_seen_at": merged.get("last_seen_at"),
+            },
+            prefer="return=minimal",
+        )
+        for record in duplicate_records:
+            duplicate_id = int(record["id"])
+            if duplicate_id != keeper_id:
+                supabase_request(
+                    "PATCH",
+                    "job_results",
+                    params={"id": f"eq.{duplicate_id}"},
+                    json_body={"merged_into_id": keeper_id},
+                    prefer="return=minimal",
+                )
+    st.session_state["job_fingerprint_migration_done"] = True
+
+
 def search_google_jobs_query(api_key: str, query: str) -> list[dict]:
     params = {
         "engine": "google_jobs",
@@ -1555,7 +2031,7 @@ def save_job_results_supabase(
     cv_text: str = "",
 ) -> tuple[int, int, int]:
     created_at = utc_now()
-    rows = []
+    saved_count = 0
     skipped = 0
     cv_positive_count = 0
     for job in jobs:
@@ -1576,6 +2052,9 @@ def save_job_results_supabase(
         location = clean_text(job.get("location"))
         apply_link = best_apply_link(job)
         job_url = normalize_job_url(job)
+        job_fingerprint = job_fingerprint_from_values(employer_name, title, location, apply_link, job_url)
+        posted_at = clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at"))
+        salary = get_salary(job)
         application_text = collect_application_text(job)
         sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
         cv_match_score, cv_match_reason = calculate_cv_match(
@@ -1588,20 +2067,66 @@ def save_job_results_supabase(
         if cv_match_score > 0:
             cv_positive_count += 1
 
-        rows.append(
-            {
-                "result_key": make_result_key(company, searched_job_title, job),
+        existing_rows = supabase_request(
+            "GET",
+            "job_results",
+            params={
+                "select": ",".join(RESULT_COLUMNS),
+                "job_fingerprint": f"eq.{job_fingerprint}",
+                "merged_into_id": "is.null",
+                "limit": 1,
+            },
+        )
+        if existing_rows:
+            existing = existing_rows[0]
+            update_payload = {
                 "run_id": run_id,
                 "run_started_at": run_started_at,
+                "last_seen_at": run_started_at,
+                "posted_at": best_posted_at(existing.get("posted_at"), posted_at, existing.get("created_at"), created_at),
+                "salary": clean_text(existing.get("salary")) or salary,
+                "sponsorship_status": best_sponsorship_status(existing.get("sponsorship_status"), sponsorship_status),
+                "relevance_score": max_numeric(existing.get("relevance_score"), relevance_score),
+                "cv_match_score": max_numeric(existing.get("cv_match_score"), cv_match_score),
+                "raw_json": job,
+            }
+            if int(update_payload["relevance_score"]) > int(pd.to_numeric(pd.Series([existing.get("relevance_score")]), errors="coerce").fillna(0).iloc[0]):
+                update_payload["relevance_reason"] = relevance_reason
+            if int(update_payload["cv_match_score"]) > int(pd.to_numeric(pd.Series([existing.get("cv_match_score")]), errors="coerce").fillna(0).iloc[0]):
+                update_payload["cv_match_reason"] = cv_match_reason
+            if update_payload["sponsorship_status"] != normalize_sponsorship_status(existing.get("sponsorship_status")):
+                update_payload["sponsorship_reason"] = sponsorship_reason
+            if not clean_text(existing.get("description")) and description:
+                update_payload["description"] = description
+            supabase_request(
+                "PATCH",
+                "job_results",
+                params={"id": f"eq.{existing.get('id')}"},
+                json_body=update_payload,
+                prefer="return=minimal",
+            )
+            saved_count += 1
+            continue
+
+        supabase_request(
+            "POST",
+            "job_results",
+            json_body={
+                "result_key": make_result_key(company, searched_job_title, job),
+                "job_fingerprint": job_fingerprint,
+                "run_id": run_id,
+                "run_started_at": run_started_at,
+                "first_seen_at": run_started_at,
+                "last_seen_at": run_started_at,
                 "company": company,
                 "searched_job_title": searched_job_title,
                 "title": title,
                 "employer_name": employer_name,
                 "location": location,
                 "via": clean_text(job.get("via")),
-                "posted_at": clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at")),
+                "posted_at": posted_at,
                 "schedule_type": clean_text(job.get("detected_extensions", {}).get("schedule_type")),
-                "salary": get_salary(job),
+                "salary": salary,
                 "description": description,
                 "job_url": job_url,
                 "apply_link": apply_link,
@@ -1611,14 +2136,18 @@ def save_job_results_supabase(
                 "relevance_reason": relevance_reason,
                 "cv_match_score": int(cv_match_score),
                 "cv_match_reason": cv_match_reason,
+                "status": "New",
+                "notes": "",
+                "application_status": "New",
+                "applied_date": None,
+                "application_notes": "",
                 "raw_json": job,
                 "created_at": created_at,
-            }
+            },
+            prefer="return=minimal",
         )
-
-    if rows:
-        supabase_upsert("job_results", rows, "result_key")
-    return len(rows), skipped, cv_positive_count
+        saved_count += 1
+    return saved_count, skipped, cv_positive_count
 
 
 def save_job_results(
@@ -1666,6 +2195,9 @@ def save_job_results(
             location = clean_text(job.get("location"))
             apply_link = best_apply_link(job)
             job_url = normalize_job_url(job)
+            job_fingerprint = job_fingerprint_from_values(employer_name, title, location, apply_link, job_url)
+            posted_at = clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at"))
+            salary = get_salary(job)
             application_text = collect_application_text(job)
             sponsorship_status, sponsorship_reason = detect_sponsorship_status(title, description, application_text)
             cv_match_score, cv_match_reason = calculate_cv_match(
@@ -1678,12 +2210,65 @@ def save_job_results(
             if cv_match_score > 0:
                 cv_positive_count += 1
 
-            cursor = conn.execute(
+            existing = conn.execute(
+                "SELECT * FROM job_results WHERE job_fingerprint = ? AND merged_into_id IS NULL LIMIT 1",
+                (job_fingerprint,),
+            ).fetchone()
+            if existing:
+                existing_record = dict(existing)
+                existing_relevance = max_numeric(existing_record.get("relevance_score"))
+                existing_cv = max_numeric(existing_record.get("cv_match_score"))
+                updated_relevance = max_numeric(existing_relevance, relevance_score)
+                updated_cv = max_numeric(existing_cv, cv_match_score)
+                updated_sponsorship = best_sponsorship_status(existing_record.get("sponsorship_status"), sponsorship_status)
+                conn.execute(
+                    """
+                    UPDATE job_results
+                    SET
+                        run_id = ?,
+                        run_started_at = ?,
+                        last_seen_at = ?,
+                        posted_at = ?,
+                        salary = ?,
+                        description = ?,
+                        sponsorship_status = ?,
+                        sponsorship_reason = ?,
+                        relevance_score = ?,
+                        relevance_reason = ?,
+                        cv_match_score = ?,
+                        cv_match_reason = ?,
+                        raw_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        run_id,
+                        run_started_at,
+                        run_started_at,
+                        best_posted_at(existing_record.get("posted_at"), posted_at, existing_record.get("created_at"), created_at),
+                        clean_text(existing_record.get("salary")) or salary,
+                        clean_text(existing_record.get("description")) or description,
+                        updated_sponsorship,
+                        sponsorship_reason if updated_sponsorship != normalize_sponsorship_status(existing_record.get("sponsorship_status")) else existing_record.get("sponsorship_reason"),
+                        updated_relevance,
+                        relevance_reason if updated_relevance > existing_relevance else existing_record.get("relevance_reason"),
+                        updated_cv,
+                        cv_match_reason if updated_cv > existing_cv else existing_record.get("cv_match_reason"),
+                        json.dumps(job),
+                        existing_record.get("id"),
+                    ),
+                )
+                inserted += 1
+                continue
+
+            conn.execute(
                 """
                 INSERT INTO job_results (
                     result_key,
+                    job_fingerprint,
                     run_id,
                     run_started_at,
+                    first_seen_at,
+                    last_seen_at,
                     company,
                     searched_job_title,
                     title,
@@ -1710,34 +2295,14 @@ def save_job_results(
                     raw_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(result_key) DO UPDATE SET
-                    run_id = excluded.run_id,
-                    run_started_at = excluded.run_started_at,
-                    company = excluded.company,
-                    searched_job_title = excluded.searched_job_title,
-                    title = excluded.title,
-                    employer_name = excluded.employer_name,
-                    location = excluded.location,
-                    via = excluded.via,
-                    posted_at = excluded.posted_at,
-                    schedule_type = excluded.schedule_type,
-                    salary = excluded.salary,
-                    description = excluded.description,
-                    job_url = excluded.job_url,
-                    apply_link = excluded.apply_link,
-                    sponsorship_status = excluded.sponsorship_status,
-                    sponsorship_reason = excluded.sponsorship_reason,
-                    relevance_score = excluded.relevance_score,
-                    relevance_reason = excluded.relevance_reason,
-                    cv_match_score = excluded.cv_match_score,
-                    cv_match_reason = excluded.cv_match_reason,
-                    raw_json = excluded.raw_json,
-                    created_at = excluded.created_at
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     make_result_key(company, searched_job_title, job),
+                    job_fingerprint,
                     run_id,
+                    run_started_at,
+                    run_started_at,
                     run_started_at,
                     company,
                     searched_job_title,
@@ -1745,9 +2310,9 @@ def save_job_results(
                     employer_name,
                     location,
                     clean_text(job.get("via")),
-                    clean_text(job.get("detected_extensions", {}).get("posted_at") or job.get("posted_at")),
+                    posted_at,
                     clean_text(job.get("detected_extensions", {}).get("schedule_type")),
-                    get_salary(job),
+                    salary,
                     description,
                     job_url,
                     apply_link,
@@ -1766,7 +2331,7 @@ def save_job_results(
                     created_at,
                 ),
             )
-            inserted += cursor.rowcount
+            inserted += 1
     return inserted, skipped, cv_positive_count
 
 
@@ -2005,12 +2570,15 @@ def migrate_recovered_data_to_supabase(tables: dict[str, pd.DataFrame]) -> dict[
 
 BASE_EXPORT_COLUMNS = [
     "id",
+    "job_fingerprint",
     "company",
     "title",
     "employer_name",
     "location",
     "salary",
     "posted_at",
+    "first_seen_at",
+    "last_seen_at",
     "schedule_type",
     "sponsorship_status",
     "cv_match_score",
@@ -2179,6 +2747,8 @@ def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = Fals
             "Location": source.get("location", ""),
             "Salary": source.get("salary", ""),
             "Posted": source.get("posted_at", ""),
+            "First Seen": source.get("first_seen_at", ""),
+            "Last Seen": source.get("last_seen_at", ""),
             "Sponsorship Status": sponsorship,
             "Sponsorship Reason": source.get("sponsorship_reason", ""),
             "CV Match %": source.get("CV Match %", ""),
@@ -2189,6 +2759,7 @@ def dashboard_master_table(df: pd.DataFrame, show_technical_details: bool = Fals
         }
     )
     if show_technical_details:
+        table["job_fingerprint"] = source.get("job_fingerprint", "")
         table["searched_job_title"] = source.get("searched_job_title", "")
         table["run_id"] = source.get("run_id", "")
         table["run_started_at"] = source.get("run_started_at", "")
@@ -2886,6 +3457,9 @@ def render_search_section(companies: pd.DataFrame, job_titles: pd.DataFrame) -> 
 
 def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles: pd.DataFrame) -> None:
     st.subheader("Jobs Dashboard")
+    tracking_message = st.session_state.pop("tracking_updated_message", None)
+    if tracking_message:
+        st.success(tracking_message)
     total_companies = len(companies) if companies is not None else 0
     total_job_titles = len(job_titles) if job_titles is not None else 0
     total_search_combinations = total_companies * total_job_titles
@@ -2911,6 +3485,12 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
     col2.metric("Companies", results["company"].nunique())
     col3.metric("Sponsorship available", results["sponsorship_status"].map(is_sponsorship_available_status).sum())
 
+    st.markdown("### Tracking Counts")
+    status_counts = working["application_status"].value_counts().to_dict()
+    status_count_cols = st.columns(6)
+    for index, status_name in enumerate(["New", "Interested", "Applied", "Interview", "Offer", "Rejected"]):
+        status_count_cols[index].metric(status_name, int(status_counts.get(status_name, 0)))
+
     st.markdown("### Filters")
     filter_cols = st.columns(3)
     company_filter = filter_cols[0].multiselect(
@@ -2926,7 +3506,7 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         options=["All", *APPLICATION_STATUSES],
     )
 
-    filter_cols_2 = st.columns(3)
+    filter_cols_2 = st.columns(4)
     sponsorship_status_filter = filter_cols_2[0].selectbox(
         "Sponsorship Status",
         options=list(SPONSORSHIP_STATUS_OPTIONS),
@@ -2934,6 +3514,10 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
     )
     cv_minimum = filter_cols_2[1].slider("CV Match %", min_value=0, max_value=100, value=0, step=5)
     relevance_minimum = filter_cols_2[2].slider("Relevance Score", min_value=0, max_value=5, value=0, step=1)
+    seen_filter = filter_cols_2[3].selectbox(
+        "Seen status",
+        options=["All", "New this run", "Seen before", "Not seen in latest run"],
+    )
 
     quick_cols = st.columns(3)
     only_sponsorship_available = quick_cols[0].checkbox("Show only sponsorship available")
@@ -2965,6 +3549,24 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
         filtered = filtered[filtered["application_status"] == "Interview"]
     if only_active:
         filtered = filtered[filtered["application_status"].isin(ACTIVE_APPLICATION_STATUSES)]
+    dashboard_latest_run_id = latest_run_id(pd.DataFrame(), working)
+    if seen_filter == "New this run" and dashboard_latest_run_id:
+        first_seen = pd.to_datetime(filtered.get("first_seen_at", ""), errors="coerce", utc=True)
+        latest_run_started = pd.to_datetime(
+            working.loc[working["run_id"].map(clean_text) == dashboard_latest_run_id, "run_started_at"],
+            errors="coerce",
+            utc=True,
+        )
+        latest_timestamp = latest_run_started.max() if not latest_run_started.empty else pd.NaT
+        filtered = filtered[(filtered["run_id"].map(clean_text) == dashboard_latest_run_id) & (first_seen >= latest_timestamp)]
+    elif seen_filter == "Seen before":
+        filtered = filtered[
+            (filtered.get("first_seen_at", "").map(clean_text) != "")
+            & (filtered.get("last_seen_at", "").map(clean_text) != "")
+            & (filtered.get("first_seen_at", "").map(clean_text) != filtered.get("last_seen_at", "").map(clean_text))
+        ]
+    elif seen_filter == "Not seen in latest run" and dashboard_latest_run_id:
+        filtered = filtered[filtered["run_id"].map(clean_text) != dashboard_latest_run_id]
     filtered = filtered[pd.to_numeric(filtered["relevance_score"], errors="coerce").fillna(0) >= relevance_minimum]
     cv_scores = cv_match_numeric_series(filtered)
     filtered = filtered[(cv_scores.fillna(-1) >= cv_minimum) | (cv_minimum == 0)]
@@ -2973,11 +3575,18 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
 
     st.markdown("### All Matching Jobs")
     if filtered.empty:
+        if only_applied or application_status_filter == "Applied":
+            st.info("No jobs marked as Applied yet")
+            return
         st.info("No jobs match the current filters.")
         return
 
     show_technical_details = st.checkbox("Show technical details", value=False)
     master_table = dashboard_master_table(filtered, show_technical_details=show_technical_details)
+    fingerprint_lookup = {
+        clean_text(row.get("id")): clean_text(row.get("job_fingerprint"))
+        for _, row in ensure_job_ids(filtered).iterrows()
+    }
     edited = st.data_editor(
         master_table,
         use_container_width=True,
@@ -2995,6 +3604,8 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
             "Location": st.column_config.TextColumn("Location"),
             "Salary": st.column_config.TextColumn("Salary"),
             "Posted": st.column_config.TextColumn("Posted"),
+            "First Seen": st.column_config.TextColumn("First Seen"),
+            "Last Seen": st.column_config.TextColumn("Last Seen"),
             "Sponsorship Status": st.column_config.TextColumn("Sponsorship Status"),
             "Sponsorship Reason": st.column_config.TextColumn("Sponsorship Reason", width="medium"),
             "CV Match %": st.column_config.TextColumn("CV Match %"),
@@ -3006,23 +3617,37 @@ def render_dashboard(results: pd.DataFrame, companies: pd.DataFrame, job_titles:
                 required=True,
             ),
             "Notes": st.column_config.TextColumn("Notes", width="large"),
+            "job_fingerprint": st.column_config.TextColumn("job_fingerprint"),
             "searched_job_title": st.column_config.TextColumn("searched_job_title"),
             "run_id": st.column_config.TextColumn("run_id"),
             "run_started_at": st.column_config.TextColumn("run_started_at"),
         },
     )
 
-    if st.button("Save Dashboard Updates", type="primary"):
-        for _, row in edited.iterrows():
-            job_id = clean_text(row.get("Job ID"))
-            if not job_id:
-                continue
-            update_job_tracking(
-                int(job_id),
-                clean_text(row.get("Application Status")),
-                clean_text(row.get("Notes")),
-            )
-        st.success("Dashboard updates saved.")
+    changed_rows = []
+    original_tracking = master_table.set_index("Job ID")[["Application Status", "Notes"]]
+    edited_tracking = edited.set_index("Job ID")[["Application Status", "Notes"]]
+    for job_id in edited_tracking.index:
+        if job_id not in original_tracking.index:
+            continue
+        original_status = clean_text(original_tracking.at[job_id, "Application Status"])
+        original_notes = clean_text(original_tracking.at[job_id, "Notes"])
+        edited_status = clean_text(edited_tracking.at[job_id, "Application Status"])
+        edited_notes = clean_text(edited_tracking.at[job_id, "Notes"])
+        if original_status != edited_status or original_notes != edited_notes:
+            changed_rows.append((job_id, edited_status, edited_notes))
+
+    if changed_rows:
+        saved_any = False
+        for job_id, edited_status, edited_notes in changed_rows:
+            saved_any = update_job_tracking(
+                job_id,
+                edited_status,
+                edited_notes,
+                job_fingerprint=fingerprint_lookup.get(clean_text(job_id), ""),
+            ) or saved_any
+        if saved_any:
+            st.session_state["tracking_updated_message"] = "Tracking updated"
         st.rerun()
 
     include_search_metadata = st.checkbox(
@@ -3240,6 +3865,8 @@ def main() -> None:
     supabase_status = get_supabase_setup_status(supabase_url, supabase_key)
     st.session_state["supabase_connected"] = bool(supabase_status.get("connected"))
     init_storage()
+    if is_supabase_connected():
+        migrate_supabase_job_fingerprints()
 
     st.title("U.S. Job Search")
     st.caption("Upload target companies and roles, search Google Jobs through SerpAPI, and export deduplicated results.")
